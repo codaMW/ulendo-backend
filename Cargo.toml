@@ -1,0 +1,65 @@
+[package]
+name = "ulendo-backend"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ulendo"
+path = "src/main.rs"
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["ws", "multipart"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "limit"] }
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+
+# Database
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "migrate", "chrono"] }
+
+# Serialisation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto — NIP-98 auth + VAPID signing
+secp256k1 = { version = "0.28", features = ["global-context", "rand-std"] }
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+base64 = "0.22"
+bech32 = "0.11"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Nostr relay client — no tor feature
+nostr-sdk = { version = "0.34", default-features = false, features = ["all-nips"] }
+
+# Env
+dotenvy = "0.15"
+
+# Errors
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUIDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# ECDH for VAPID (Web Push signing)
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

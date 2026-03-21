@@ -1,0 +1,37 @@
+# Fly.io deployment config for Ulendo backend
+# Deploy with: fly deploy
+# First time: fly launch --no-deploy, then fly deploy
+
+app     = "ulendo-backend"
+primary_region = "jnb"   # Johannesburg — closest to Malawi
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8080"
+  DATABASE_URL = "sqlite:/data/ulendo.db"
+
+[mounts]
+  # Persistent volume for SQLite database
+  # Create with: fly volumes create ulendo_data --size 1 --region jnb
+  source      = "ulendo_data"
+  destination = "/data"
+
+[http_service]
+  internal_port       = 8080
+  force_https         = true
+  auto_stop_machines  = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type       = "connections"
+    hard_limit = 100
+    soft_limit = 80
+
+[[vm]]
+  memory      = "256mb"
+  cpu_kind    = "shared"
+  cpus        = 1
