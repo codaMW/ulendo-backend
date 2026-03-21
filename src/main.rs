@@ -21,7 +21,7 @@ pub mod services;
 pub use error::{AppError, AppResult};
 
 
-// ── Shared state ──────────────────────────────────────────────────────────────
+// ── Shared state ──────────────────────────────────────────────────────────
 #[derive(Clone)]
 pub struct AppState {
     pub db:    sqlx::SqlitePool,
