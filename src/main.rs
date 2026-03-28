@@ -19,6 +19,7 @@ pub mod routes;
 pub mod services;
 
 pub use error::{AppError, AppResult};
+pub use routes::ws::WsRegistry;
 
 
 // ── Shared state ──────────────────────────────────────────────────────────
@@ -28,6 +29,7 @@ pub struct AppState {
     pub cfg:   Arc<Config>,
     pub blink: Arc<services::blink::BlinkClient>,
     pub push:  Arc<services::push::PushService>,
+    pub ws:    WsRegistry,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +128,7 @@ async fn main() -> Result<()> {
         cfg:   Arc::new(cfg.clone()),
         blink,
         push,
+        ws: routes::ws::new_registry(),
     };
 
     // Background: Nostr relay indexer
@@ -174,6 +177,7 @@ async fn main() -> Result<()> {
         .route("/push/vapid-key",         get(routes::push::vapid_public_key))
         .route("/push/subscribe",         post(routes::push::subscribe))
         .route("/push/unsubscribe",       delete(routes::push::unsubscribe))
+        .route("/ws", get(routes::ws::ws_handler))
         // Relay cache
         .route("/relay/listings",         get(routes::relay::search_listings))
         .layer(cors)
