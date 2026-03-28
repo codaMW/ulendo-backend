@@ -148,6 +148,7 @@ async fn main() -> Result<()> {
         cfg.frontend_origin.parse()?,
         "http://localhost:5173".parse()?,
         "http://localhost:4173".parse()?,
+        "https://ulendo-malawi.vercel.app".parse()?,
     ];
     let cors = CorsLayer::new()
         .allow_origin(origins)
