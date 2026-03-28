@@ -144,8 +144,13 @@ async fn main() -> Result<()> {
         services::blink::run_escrow_monitor(escrow_state).await;
     });
 
+    let origins: Vec<axum::http::HeaderValue> = vec![
+        cfg.frontend_origin.parse()?,
+        "http://localhost:5173".parse()?,
+        "http://localhost:4173".parse()?,
+    ];
     let cors = CorsLayer::new()
-        .allow_origin(cfg.frontend_origin.parse::<axum::http::HeaderValue>()?)
+        .allow_origin(origins)
         .allow_methods(Any)
         .allow_headers([
             axum::http::header::AUTHORIZATION,
