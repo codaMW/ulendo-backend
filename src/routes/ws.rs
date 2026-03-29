@@ -48,6 +48,21 @@ async fn handle_socket(socket: WebSocket, pubkey: String, registry: WsRegistry) 
     }
     tracing::info!("[ws] {} connected", &pubkey[..8.min(pubkey.len())]);
 
+    // Server-side keepalive: ping client every 30s to prevent Railway proxy timeout
+    let ping_tx = {
+        let reg = registry.lock().await;
+        reg.get(&pubkey).cloned()
+    };
+    if let Some(tx) = ping_tx {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if tx.send(r#"{"type":"ping"}"#.to_string()).is_err() { break; }
+            }
+        });
+    }
+
     let send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             if sender.send(Message::Text(msg)).await.is_err() {
@@ -61,6 +76,14 @@ async fn handle_socket(socket: WebSocket, pubkey: String, registry: WsRegistry) 
     let recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             if let Message::Text(text) = msg {
+                // Handle client keepalive pings
+                if text.contains("\"ping\"") {
+                    let reg = reg_clone.lock().await;
+                    if let Some(tx) = reg.get(&pk) {
+                        let _ = tx.send(r#"{"type":"pong"}"#.to_string());
+                    }
+                    continue;
+                }
                 if let Ok(mut envelope) = serde_json::from_str::<RideMessage>(&text) {
                     envelope.from = pk.clone();
                     let out = serde_json::to_string(&envelope).unwrap_or_default();
