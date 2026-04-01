@@ -1,6 +1,5 @@
 use axum::{
     extract::{Multipart, State},
-    http::StatusCode,
     Json,
 };
 use serde_json::{json, Value};
