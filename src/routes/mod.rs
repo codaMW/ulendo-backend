@@ -6,3 +6,4 @@ pub mod push;
 pub mod relay;pub mod ws;
 
 pub mod upload;
+pub mod verify;

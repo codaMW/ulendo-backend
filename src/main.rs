@@ -185,6 +185,8 @@ async fn main() -> Result<()> {
         .route("/push/unsubscribe",       delete(routes::push::unsubscribe))
         .route("/ws", get(routes::ws::ws_handler))
         .route("/upload/photo", post(routes::upload::upload_photo))
+        .route("/verify/invoice",       post(routes::verify::create_invoice))
+        .route("/verify/invoice/check", post(routes::verify::check_invoice))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
