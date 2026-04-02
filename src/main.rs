@@ -193,8 +193,8 @@ async fn main() -> Result<()> {
         )
         // Relay cache
         .route("/relay/listings",         get(routes::relay::search_listings))
-        .route("/verify/invoice",       post(routes::verify::create_invoice))
-        .route("/verify/invoice/check", post(routes::verify::check_invoice))
+        .route("/verify/invoice",       post(routes::upload::create_verify_invoice))
+        .route("/verify/invoice/check", post(routes::upload::check_verify_invoice))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(RequestBodyLimitLayer::new(256 * 1024))

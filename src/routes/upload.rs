@@ -93,3 +93,48 @@ pub async fn upload_photo(
 
     Err(AppError::BadRequest("all upload providers failed".into()))
 }
+
+
+// ── Verification invoice routes ──────────────────────────────────────────────
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+pub struct VerifyInvoiceReq {
+    pub tier: String,
+    pub npub: String,
+}
+
+pub async fn create_verify_invoice(
+    State(state): State<AppState>,
+    Json(body): Json<VerifyInvoiceReq>,
+) -> AppResult<Json<serde_json::Value>> {
+    let sats: i64 = match body.tier.as_str() {
+        "silver" => 6000,
+        "gold"   => 12000,
+        "orange" => 27000,
+        _ => return Err(AppError::BadRequest("invalid tier".into())),
+    };
+    let memo = format!("Ulendo {} verification for {}", body.tier, body.npub);
+    let inv = state.blink.create_invoice(sats, &memo).await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "payment_request": inv.payment_request,
+        "payment_hash": inv.payment_hash,
+        "tier": body.tier,
+        "sats": sats
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct CheckInvoiceReq {
+    pub payment_request: String,
+}
+
+pub async fn check_verify_invoice(
+    State(state): State<AppState>,
+    Json(body): Json<CheckInvoiceReq>,
+) -> AppResult<Json<serde_json::Value>> {
+    let paid = state.blink.is_invoice_paid(&body.payment_request).await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "paid": paid })))
+}
