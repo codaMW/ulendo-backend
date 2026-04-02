@@ -185,8 +185,6 @@ async fn main() -> Result<()> {
         .route("/push/unsubscribe",       delete(routes::push::unsubscribe))
         .route("/ws", get(routes::ws::ws_handler))
         .route("/upload/photo", post(routes::upload::upload_photo))
-        .route("/verify/invoice",       post(routes::verify::create_invoice))
-        .route("/verify/invoice/check", post(routes::verify::check_invoice))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -195,6 +193,8 @@ async fn main() -> Result<()> {
         )
         // Relay cache
         .route("/relay/listings",         get(routes::relay::search_listings))
+        .route("/verify/invoice",       post(routes::verify::create_invoice))
+        .route("/verify/invoice/check", post(routes::verify::check_invoice))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(RequestBodyLimitLayer::new(256 * 1024))
