@@ -198,7 +198,7 @@ async fn main() -> Result<()> {
         .route("/verify/invoice/check", post(routes::upload::check_verify_invoice))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
-        .layer(RequestBodyLimitLayer::new(256 * 1024))
+        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
         .with_state(state);
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
