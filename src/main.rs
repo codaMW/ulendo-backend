@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/version", get(|| async { "ulendo-backend-v2-verify" }))
+        .route("/version", get(|| async { "ulendo-backend-v2-presence" }))
         // Identities
         .route("/identities",        post(routes::identities::upsert))
         .route("/identities/:npub",  get(routes::identities::get_by_npub))
