@@ -110,3 +110,11 @@ async fn handle_socket(socket: WebSocket, pubkey: String, registry: WsRegistry) 
     registry.lock().await.remove(&pubkey);
     tracing::info!("[ws] {} disconnected", &pubkey[..8.min(pubkey.len())]);
 }
+
+pub async fn online_drivers(
+    State(state): State<crate::AppState>,
+) -> axum::Json<Vec<String>> {
+    let reg = state.ws.lock().await;
+    let keys: Vec<String> = reg.keys().cloned().collect();
+    axum::Json(keys)
+}
