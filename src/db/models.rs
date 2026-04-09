@@ -60,6 +60,7 @@ pub struct Booking {
     pub released_at:      Option<i64>,
     pub disputed_at:      Option<i64>,
     pub refunded_at:      Option<i64>,
+    pub completed_at:     Option<i64>,
     pub cancelled_at:     Option<i64>,
     pub created_at:       i64,
     pub updated_at:       i64,

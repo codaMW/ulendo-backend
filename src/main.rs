@@ -144,6 +144,12 @@ async fn main() -> Result<()> {
         services::blink::run_escrow_monitor(escrow_state).await;
     });
 
+    // Background: auto-release completed bookings after 60 seconds
+    let release_state = state.clone();
+    tokio::spawn(async move {
+        services::blink::run_auto_release(release_state).await;
+    });
+
     let origins: Vec<axum::http::HeaderValue> = vec![
         cfg.frontend_origin.parse()?,
         "http://localhost:5173".parse()?,
@@ -180,6 +186,7 @@ async fn main() -> Result<()> {
         .route("/escrow/:id/release",     post(routes::escrow::release))
         .route("/escrow/:id/dispute",     post(routes::escrow::dispute))
         .route("/escrow/:id/refund",      post(routes::escrow::refund))
+        .route("/escrow/:id/complete",    post(routes::escrow::complete))
         // Push
         .route("/push/vapid-key",         get(routes::push::vapid_public_key))
         .route("/push/subscribe",         post(routes::push::subscribe))

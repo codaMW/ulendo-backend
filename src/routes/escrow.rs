@@ -211,20 +211,13 @@ pub async fn dispute(
 
     let now = chrono::Utc::now().timestamp();
 
-    // For rides: merchant gets base_fare from the listing, booker gets the rest back
+    // Dispute split: 30% to driver, 70% refunded to booker
+    // For non-ride bookings: full refund
     let (merchant_sats, booker_refund_sats) = if booking.booking_type == "ride" {
-        let base_fare: i64 = sqlx::query_scalar(
-            "SELECT price_sats FROM listings WHERE id=?1"
-        )
-        .bind(&booking.listing_id)
-        .fetch_optional(&state.db)
-        .await?
-        .unwrap_or(0);
-
-        let base = base_fare.min(booking.amount_sats);
-        (base, booking.amount_sats - base)
+        let driver_share = (booking.amount_sats * 30) / 100;
+        let booker_share = booking.amount_sats - driver_share;
+        (driver_share, booker_share)
     } else {
-        // Listing bookings: full refund to booker
         (0i64, booking.amount_sats)
     };
 
@@ -336,5 +329,72 @@ pub async fn refund(
         amount_sats:   booking.amount_sats,
         fee_sats:      0,
         released_sats: booking.amount_sats,
+    }))
+}
+// ── Complete ──────────────────────────────────────────────────────────────────
+// Driver marks ride as complete → starts 1-minute auto-release countdown.
+// Booker can still release immediately or raise dispute within 60 seconds.
+
+pub async fn complete(
+    Path(booking_id): Path<String>,
+    State(state): State<crate::AppState>,
+) -> AppResult<Json<EscrowActionResponse>> {
+    let booking = fetch_booking(&state, &booking_id).await?;
+
+    if !["funded", "held", "in_progress"].contains(&booking.status.as_str()) {
+        return Err(AppError::BadRequest(
+            format!("cannot complete from status '{}'", booking.status)
+        ));
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    sqlx::query(
+        "UPDATE bookings SET status='completed', completed_at=?1, updated_at=?2 WHERE id=?3"
+    )
+    .bind(now).bind(now).bind(&booking_id)
+    .execute(&state.db)
+    .await?;
+
+    tracing::info!(booking_id = %booking_id, "ride completed — 60s auto-release countdown started");
+
+    // Notify booker: release or dispute within 60 seconds
+    notify_booker(
+        &state, &booking,
+        "Ride complete!",
+        "Release payment now or it auto-releases in 60 seconds.",
+    ).await;
+
+    // Notify driver via WebSocket
+    {
+        let reg = state.ws.lock().await;
+        // Find the listing owner's pubkey to send WS notification
+        let owner_npub: Option<String> = sqlx::query_scalar(
+            "SELECT owner_npub FROM listings WHERE id=?1"
+        )
+        .bind(&booking.listing_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+
+        if let Some(npub) = owner_npub {
+            if let Some(tx) = reg.get(&npub) {
+                let msg = serde_json::json!({
+                    "type": "escrow-completing",
+                    "booking_id": booking_id,
+                    "auto_release_at": now + 60,
+                });
+                let _ = tx.send(msg.to_string());
+            }
+        }
+    }
+
+    Ok(Json(EscrowActionResponse {
+        booking_id,
+        status:        "completed".into(),
+        amount_sats:   booking.amount_sats,
+        fee_sats:      booking.fee_sats,
+        released_sats: 0,
     }))
 }

@@ -285,3 +285,120 @@ async fn notify_booking_funded(state: &AppState, booking: &crate::db::Booking) {
         let _ = state.push.send(&sub, payload.to_string()).await;
     }
 }
+/// Background task: auto-releases completed bookings after 60 seconds.
+/// Runs every 15 seconds to check for bookings ready to release.
+pub async fn run_auto_release(state: AppState) {
+    tracing::info!("auto-release monitor started (60s window)");
+    loop {
+        sleep(Duration::from_secs(15)).await;
+
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - 60; // 1 minute ago
+
+        // Find completed bookings older than 60 seconds
+        let ready = sqlx::query_as::<_, crate::db::Booking>(
+            "SELECT * FROM bookings WHERE status = 'completed' AND completed_at IS NOT NULL AND completed_at <= ?1"
+        )
+        .bind(cutoff)
+        .fetch_all(&state.db)
+        .await;
+
+        let bookings = match ready {
+            Ok(b) => b,
+            Err(e) => { tracing::warn!("auto-release db error: {e}"); continue; }
+        };
+
+        for booking in bookings {
+            tracing::info!("auto-releasing booking {} (completed {}s ago)", booking.id, now - booking.completed_at.unwrap_or(now));
+
+            // Calculate split: 95% to driver, 5% to Ulendo
+            let fee_bps = state.cfg.escrow_fee_bps as i64; // basis points (500 = 5%)
+            let fee_sats = (booking.amount_sats * fee_bps) / 10000;
+            let driver_sats = booking.amount_sats - fee_sats;
+
+            // Get driver's Lightning address
+            let driver_lud16: Option<String> = sqlx::query_scalar(
+                "SELECT lud16 FROM listings WHERE id=?1"
+            )
+            .bind(&booking.listing_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+
+            if let Some(lud16) = driver_lud16 {
+                match state.blink.send_to_address(&lud16, driver_sats, "Ulendo ride payment").await {
+                    Ok(_) => {
+                        let res = sqlx::query(
+                            "UPDATE bookings SET status='released', fee_sats=?1, released_at=?2, updated_at=?3 WHERE id=?4 AND status='completed'"
+                        )
+                        .bind(fee_sats)
+                        .bind(now)
+                        .bind(now)
+                        .bind(&booking.id)
+                        .execute(&state.db)
+                        .await;
+
+                        if let Ok(r) = res {
+                            if r.rows_affected() > 0 {
+                                tracing::info!(
+                                    "booking {} auto-released: {} sats to driver, {} sats fee",
+                                    booking.id, driver_sats, fee_sats
+                                );
+
+                                // Notify driver
+                                let subs = sqlx::query_as::<_, crate::db::PushSubscription>(
+                                    "SELECT ps.* FROM push_subscriptions ps
+                                     JOIN listings l ON l.owner_npub = ps.npub
+                                     WHERE l.id = ?1"
+                                )
+                                .bind(&booking.listing_id)
+                                .fetch_all(&state.db)
+                                .await
+                                .unwrap_or_default();
+
+                                for sub in subs {
+                                    let payload = serde_json::json!({
+                                        "title": "Payment received!",
+                                        "body": format!("{} sats sent to your wallet", driver_sats),
+                                        "data": { "booking_id": booking.id, "type": "escrow_released" }
+                                    });
+                                    let _ = state.push.send(&sub, payload.to_string()).await;
+                                }
+
+                                // Notify booker
+                                notify_booking_released(&state, &booking, driver_sats, fee_sats).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("auto-release payment failed for {}: {e}", booking.id);
+                        // Don't change status — will retry in 15s
+                    }
+                }
+            } else {
+                tracing::warn!("booking {} has no driver lud16 — cannot auto-release", booking.id);
+            }
+        }
+    }
+}
+
+async fn notify_booking_released(state: &AppState, booking: &crate::db::Booking, driver_sats: i64, fee_sats: i64) {
+    let subs = sqlx::query_as::<_, crate::db::PushSubscription>(
+        "SELECT * FROM push_subscriptions WHERE npub = ?1"
+    )
+    .bind(&booking.booker_npub)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    for sub in subs {
+        let payload = serde_json::json!({
+            "title": "Payment released",
+            "body": format!("{} sats sent to driver. Thank you for riding with Ulendo!", driver_sats),
+            "data": { "booking_id": booking.id, "type": "escrow_auto_released" }
+        });
+        let _ = state.push.send(&sub, payload.to_string()).await;
+    }
+}
