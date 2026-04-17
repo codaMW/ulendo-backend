@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
-    tracing::info!("Starting Ulendo backend on {}:{}", cfg.host, cfg.port);
+    tracing::info!("Starting Ulendo backend v1.1 on {}:{}", cfg.host, cfg.port);
 
     let opts = SqliteConnectOptions::from_str(&cfg.database_url)?
         .create_if_missing(true)
