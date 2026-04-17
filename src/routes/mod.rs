@@ -7,3 +7,4 @@ pub mod relay;
 pub mod ws;
 pub mod upload;
 pub mod verify;
+pub mod names;

@@ -166,6 +166,10 @@ async fn main() -> Result<()> {
         ]);
 
     let app = Router::new()
+        .route("/.well-known/nostr.json", get(routes::names::well_known_nostr_json))
+        .route("/names/check", get(routes::names::check_username))
+        .route("/names/register", post(routes::names::register_name))
+        .route("/names/by-pubkey/:pubkey", get(routes::names::get_name_by_pubkey))
         .route("/health", get(health))
         .route("/version", get(|| async { "ulendo-backend-v2-presence" }))
         // Identities
