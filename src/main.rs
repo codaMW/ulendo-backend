@@ -170,6 +170,10 @@ async fn main() -> Result<()> {
         .route("/names/check", get(routes::names::check_username))
         .route("/names/register", post(routes::names::register_name))
         .route("/names/by-pubkey/:pubkey", get(routes::names::get_name_by_pubkey))
+                .route("/chessa/quote", post(routes::chessa::create_quote))
+        .route("/chessa/pay", post(routes::chessa::pay_order))
+        .route("/chessa/order-status/:id", get(routes::chessa::get_order_status))
+        .route("/chessa/config", get(routes::chessa::get_config))
         .route("/health", get(health))
         .route("/version", get(|| async { "ulendo-backend-v2-presence" }))
         // Identities
