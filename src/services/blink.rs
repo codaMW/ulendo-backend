@@ -288,7 +288,7 @@ async fn notify_booking_funded(state: &AppState, booking: &crate::db::Booking) {
 /// Background task: auto-releases completed bookings after 60 seconds.
 /// Runs every 15 seconds to check for bookings ready to release.
 pub async fn run_auto_release(state: AppState) {
-    tracing::info!("auto-release monitor started (60s window)");
+    tracing::info!("auto-release monitor started (30m one-confirm / 2h no-confirm / 15m no-pickup)");
     loop {
         sleep(Duration::from_secs(15)).await;
 
@@ -297,7 +297,11 @@ pub async fn run_auto_release(state: AppState) {
 
         // Find completed bookings older than 60 seconds
         let ready = sqlx::query_as::<_, crate::db::Booking>(
-            "SELECT * FROM bookings WHERE status = 'completed' AND completed_at IS NOT NULL AND completed_at <= ?1"
+            "SELECT * FROM bookings WHERE
+                (status = 'completed' AND completed_at IS NOT NULL AND completed_at <= ?1)
+                OR (status IN ('funded','held') AND pickup_confirmed_at IS NULL AND funded_at IS NOT NULL AND funded_at <= ?2)
+                OR (status = 'in_progress' AND driver_confirmed_at IS NULL AND rider_confirmed_at IS NULL AND pickup_confirmed_at IS NOT NULL AND pickup_confirmed_at <= ?3)
+            "
         )
         .bind(cutoff)
         .fetch_all(&state.db)
@@ -384,7 +388,7 @@ pub async fn run_auto_release(state: AppState) {
     }
 }
 
-async fn notify_booking_released(state: &AppState, booking: &crate::db::Booking, driver_sats: i64, fee_sats: i64) {
+async fn notify_booking_released(state: &AppState, booking: &crate::db::Booking, driver_sats: i64, _fee_sats: i64) {
     let subs = sqlx::query_as::<_, crate::db::PushSubscription>(
         "SELECT * FROM push_subscriptions WHERE npub = ?1"
     )

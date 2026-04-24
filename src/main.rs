@@ -72,7 +72,7 @@ impl Config {
             rate_limit_rpm:    std::env::var("RATE_LIMIT_RPM")
                                    .unwrap_or_else(|_| "60".into()).parse().unwrap_or(60),
             escrow_fee_bps:    std::env::var("ESCROW_FEE_BPS")
-                                   .unwrap_or_else(|_| "150".into()).parse().unwrap_or(150),
+                                   .unwrap_or_else(|_| "150".into()).parse().unwrap_or(1000),
         })
     }
 }
@@ -188,6 +188,10 @@ async fn main() -> Result<()> {
         // Escrow
         .route("/escrow/:id/fund",        post(routes::escrow::fund))
         .route("/escrow/:id/release",     post(routes::escrow::release))
+        .route("/escrow/:id/rider-confirm",  post(routes::confirm::rider_confirm))
+        .route("/escrow/:id/driver-confirm", post(routes::confirm::driver_confirm))
+        .route("/escrow/:id/pickup",         post(routes::confirm::confirm_pickup))
+        .route("/escrow/:id/cancel",         post(routes::confirm::cancel_before_pickup))
         .route("/escrow/:id/dispute",     post(routes::escrow::dispute))
         .route("/escrow/:id/refund",      post(routes::escrow::refund))
         .route("/escrow/:id/complete",    post(routes::escrow::complete))
