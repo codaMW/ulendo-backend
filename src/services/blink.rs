@@ -293,9 +293,10 @@ pub async fn run_auto_release(state: AppState) {
         sleep(Duration::from_secs(15)).await;
 
         let now = chrono::Utc::now().timestamp();
-        let cutoff = now - 60; // 1 minute ago
+        let completed_cutoff = now - 1800;  // 30 min ago — one-sided confirm
+        let nopickup_cutoff  = now - 900;   // 15 min ago — no pickup refund
+        let silent_cutoff    = now - 7200;  // 2h ago — nobody confirmed
 
-        // Find completed bookings older than 60 seconds
         let ready = sqlx::query_as::<_, crate::db::Booking>(
             "SELECT * FROM bookings WHERE
                 (status = 'completed' AND completed_at IS NOT NULL AND completed_at <= ?1)
@@ -303,7 +304,9 @@ pub async fn run_auto_release(state: AppState) {
                 OR (status = 'in_progress' AND driver_confirmed_at IS NULL AND rider_confirmed_at IS NULL AND pickup_confirmed_at IS NOT NULL AND pickup_confirmed_at <= ?3)
             "
         )
-        .bind(cutoff)
+        .bind(completed_cutoff)
+        .bind(nopickup_cutoff)
+        .bind(silent_cutoff)
         .fetch_all(&state.db)
         .await;
 
@@ -313,7 +316,30 @@ pub async fn run_auto_release(state: AppState) {
         };
 
         for booking in bookings {
-            tracing::info!("auto-releasing booking {} (completed {}s ago)", booking.id, now - booking.completed_at.unwrap_or(now));
+            // Check if this is a no-pickup refund case
+            if ["funded", "held"].contains(&booking.status.as_str()) && booking.pickup_confirmed_at.is_none() {
+                tracing::info!("auto-refunding booking {} (no pickup after 15m)", booking.id);
+                if let Some(lud16) = &booking.lud16_refund {
+                    match state.blink.send_to_address(lud16, booking.amount_sats, "Ulendo auto-refund: no pickup").await {
+                        Ok(_) => {
+                            let _ = sqlx::query(
+                                "UPDATE bookings SET status='refunded', refunded_at=?1, updated_at=?2 WHERE id=?3"
+                            ).bind(now).bind(now).bind(&booking.id).execute(&state.db).await;
+                            tracing::info!("booking {} auto-refunded: {} sats (no pickup)", booking.id, booking.amount_sats);
+                        }
+                        Err(e) => tracing::error!("auto-refund failed for {}: {e}", booking.id),
+                    }
+                } else {
+                    // No refund address — cancel without refund
+                    let _ = sqlx::query(
+                        "UPDATE bookings SET status='cancelled', cancelled_at=?1, updated_at=?2 WHERE id=?3"
+                    ).bind(now).bind(now).bind(&booking.id).execute(&state.db).await;
+                    tracing::warn!("booking {} cancelled (no pickup, no refund address)", booking.id);
+                }
+                continue;
+            }
+
+            tracing::info!("auto-releasing booking {} ({}s since last state change)", booking.id, now - booking.completed_at.or(booking.pickup_confirmed_at).unwrap_or(now));
 
             // Calculate split: 95% to driver, 5% to Ulendo
             let fee_bps = state.cfg.escrow_fee_bps as i64; // basis points (500 = 5%)
@@ -335,7 +361,7 @@ pub async fn run_auto_release(state: AppState) {
                 match state.blink.send_to_address(&lud16, driver_sats, "Ulendo ride payment").await {
                     Ok(_) => {
                         let res = sqlx::query(
-                            "UPDATE bookings SET status='released', fee_sats=?1, released_at=?2, updated_at=?3 WHERE id=?4 AND status='completed'"
+                            "UPDATE bookings SET status='released', fee_sats=?1, released_at=?2, updated_at=?3 WHERE id=?4 AND status IN ('completed','in_progress')"
                         )
                         .bind(fee_sats)
                         .bind(now)
