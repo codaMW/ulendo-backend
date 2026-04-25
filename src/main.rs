@@ -174,6 +174,7 @@ async fn main() -> Result<()> {
         .route("/chessa/pay", post(routes::chessa::pay_order))
         .route("/chessa/order-status/:id", get(routes::chessa::get_order_status))
         .route("/chessa/config", get(routes::chessa::get_config))
+        .route("/chessa/pay-lightning", post(routes::chessa::pay_lightning))
         .route("/health", get(health))
         .route("/version", get(|| async { "ulendo-backend-v2-presence" }))
         // Identities

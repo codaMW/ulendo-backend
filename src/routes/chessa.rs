@@ -138,18 +138,34 @@ pub async fn pay_order(
     State(state): State<AppState>,
     Json(req): Json<PayRequest>,
 ) -> AppResult<Json<PayResponse>> {
+    // Request Lightning network funding — Chessa returns a Lightning invoice
+    // we pay with Blink exactly like escrow release (no on-chain needed)
     let funding_resp = chessa_post(
         "/v1/orders/funding",
-        json!({ "orderId": req.order_id }),
+        json!({
+            "orderId": req.order_id,
+            "network": "lightning",
+            "token":   "BTC"
+        }),
     ).await?;
 
+    // Chessa returns either a Lightning invoice or a crypto address
+    let lightning_invoice = funding_resp["lightningInvoice"]
+        .as_str().unwrap_or("").to_string();
     let crypto_address = funding_resp["cryptoAddress"]
         .as_str().unwrap_or("").to_string();
+
+    // Prefer Lightning invoice — faster, cheaper, already supported by Blink
+    let payment_destination = if !lightning_invoice.is_empty() {
+        lightning_invoice.clone()
+    } else {
+        crypto_address.clone()
+    };
 
     sqlx::query!(
         "UPDATE bookings SET chessa_order_id = ?, chessa_crypto_address = ?, payout_choice = ? WHERE id = ?",
         req.order_id,
-        crypto_address,
+        payment_destination,
         "kwacha",
         req.booking_id,
     )
@@ -157,16 +173,18 @@ pub async fn pay_order(
     .await?;
 
     tracing::info!(
-        booking = %req.booking_id,
-        order   = %req.order_id,
-        address = %crypto_address,
-        "Chessa payout pending"
+        booking  = %req.booking_id,
+        order    = %req.order_id,
+        via      = if lightning_invoice.is_empty() { "onchain" } else { "lightning" },
+        dest     = %payment_destination,
+        sats     = req.fare_sats,
+        "Chessa payout ready — pay this destination from escrow"
     );
 
     Ok(Json(PayResponse {
-        order_id: req.order_id,
-        status:   "pending".to_string(),
-        crypto_address,
+        order_id:       req.order_id,
+        status:         "pending".to_string(),
+        crypto_address: payment_destination,
     }))
 }
 
@@ -185,4 +203,63 @@ pub async fn get_order_status(
 pub async fn get_config() -> AppResult<Json<Value>> {
     let resp = chessa_get("/v1/configurations").await?;
     Ok(Json(resp))
+}
+
+#[derive(Deserialize)]
+pub struct LightningPayRequest {
+    pub booking_id: String,
+    pub invoice:    String,
+    pub fare_sats:  i64,
+}
+
+// POST /chessa/pay-lightning
+// Pays the Chessa Lightning invoice from Ulendo escrow wallet via Blink
+pub async fn pay_lightning(
+    State(state): State<AppState>,
+    Json(req): Json<LightningPayRequest>,
+) -> AppResult<Json<Value>> {
+    let blink_key    = std::env::var("BLINK_API_KEY").unwrap_or_default();
+    let blink_wallet = std::env::var("BLINK_WALLET_ID").unwrap_or_default();
+
+    // Pay Lightning invoice via Blink GraphQL
+    let gql = serde_json::json!({
+        "query": "mutation lnInvoicePaymentSend($input: LnInvoicePaymentInput!) { lnInvoicePaymentSend(input: $input) { status errors { message } } }",
+        "variables": {
+            "input": {
+                "walletId":      blink_wallet,
+                "paymentRequest": req.invoice,
+                "memo": format!("Chessa MWK payout — booking {}", req.booking_id),
+            }
+        }
+    });
+
+    let resp = Client::new()
+        .post("https://api.blink.sv/graphql")
+        .header("X-API-KEY", &blink_key)
+        .json(&gql)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+
+    let body: Value = resp.json().await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+
+    let status = body["data"]["lnInvoicePaymentSend"]["status"]
+        .as_str()
+        .unwrap_or("UNKNOWN");
+
+    let errors = &body["data"]["lnInvoicePaymentSend"]["errors"];
+    if errors.is_array() && !errors.as_array().unwrap().is_empty() {
+        let msg = errors[0]["message"].as_str().unwrap_or("Blink payment error").to_string();
+        return Err(AppError::BadRequest(msg));
+    }
+
+    tracing::info!(
+        booking = %req.booking_id,
+        status  = %status,
+        sats    = req.fare_sats,
+        "Chessa Lightning invoice paid via Blink"
+    );
+
+    Ok(Json(json!({ "status": status })))
 }
