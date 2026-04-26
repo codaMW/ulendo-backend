@@ -288,14 +288,14 @@ async fn notify_booking_funded(state: &AppState, booking: &crate::db::Booking) {
 /// Background task: auto-releases completed bookings after 60 seconds.
 /// Runs every 15 seconds to check for bookings ready to release.
 pub async fn run_auto_release(state: AppState) {
-    tracing::info!("auto-release monitor started (30m one-confirm / 2h no-confirm / 15m no-pickup)");
+    tracing::info!("auto-release monitor started (2m one-confirm / 10m no-confirm / 5m no-pickup)");
     loop {
         sleep(Duration::from_secs(15)).await;
 
         let now = chrono::Utc::now().timestamp();
-        let completed_cutoff = now - 1800;  // 30 min ago — one-sided confirm
-        let nopickup_cutoff  = now - 900;   // 15 min ago — no pickup refund
-        let silent_cutoff    = now - 7200;  // 2h ago — nobody confirmed
+        let completed_cutoff = now - 120;   // 2 min ago — one-sided confirm
+        let nopickup_cutoff  = now - 300;   // 5 min ago — no pickup refund
+        let silent_cutoff    = now - 600;   // 10 min ago — nobody confirmed
 
         let ready = sqlx::query_as::<_, crate::db::Booking>(
             "SELECT * FROM bookings WHERE

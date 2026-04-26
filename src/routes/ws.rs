@@ -36,10 +36,11 @@ pub async fn ws_handler(
     State(state): State<crate::AppState>,
 ) -> Response {
     let pubkey = params.pubkey.clone();
-    ws.on_upgrade(move |socket| handle_socket(socket, pubkey, state.ws))
+    ws.on_upgrade(move |socket| handle_socket(socket, pubkey, state))
 }
 
-async fn handle_socket(socket: WebSocket, pubkey: String, registry: WsRegistry) {
+async fn handle_socket(socket: WebSocket, pubkey: String, state: crate::AppState) {
+    let registry = state.ws.clone();
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = broadcast::channel::<String>(64);
     {
@@ -72,6 +73,7 @@ async fn handle_socket(socket: WebSocket, pubkey: String, registry: WsRegistry) 
     });
 
     let reg_clone = registry.clone();
+    let state_clone = state.clone();
     let pk = pubkey.clone();
     let recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
@@ -87,13 +89,28 @@ async fn handle_socket(socket: WebSocket, pubkey: String, registry: WsRegistry) 
                 if let Ok(mut envelope) = serde_json::from_str::<RideMessage>(&text) {
                     envelope.from = pk.clone();
                     let out = serde_json::to_string(&envelope).unwrap_or_default();
-                    let reg = reg_clone.lock().await;
-                    if let Some(tx) = reg.get(&envelope.to) {
-                        let _ = tx.send(out);
-                    }
-                    if let Some(tx) = reg.get(&pk) {
-                        let confirm = serde_json::json!({"type":"delivered","to":envelope.to});
-                        let _ = tx.send(confirm.to_string());
+                    let is_call_offer = envelope.msg_type == "ulendo-call-offer";
+                    let to_pubkey = envelope.to.clone();
+                    let caller_name = envelope.payload
+                        .get("callerName").and_then(|v| v.as_str())
+                        .unwrap_or("Someone").to_string();
+                    {
+                        let reg = reg_clone.lock().await;
+                        if let Some(tx) = reg.get(&envelope.to) {
+                            let _ = tx.send(out);
+                        } else if is_call_offer {
+                            // Recipient offline — send Web Push
+                            let state_clone = state_clone.clone();
+                            let caller = caller_name.clone();
+                            let to = to_pubkey.clone();
+                            tokio::spawn(async move {
+                                send_call_push(&state_clone, &to, &caller).await;
+                            });
+                        }
+                        if let Some(tx) = reg.get(&pk) {
+                            let confirm = serde_json::json!({"type":"delivered","to":envelope.to});
+                            let _ = tx.send(confirm.to_string());
+                        }
                     }
                 }
             } else if let Message::Close(_) = msg {
@@ -109,6 +126,41 @@ async fn handle_socket(socket: WebSocket, pubkey: String, registry: WsRegistry) 
 
     registry.lock().await.remove(&pubkey);
     tracing::info!("[ws] {} disconnected", &pubkey[..8.min(pubkey.len())]);
+}
+
+async fn send_call_push(state: &crate::AppState, to_pubkey: &str, caller_name: &str) {
+    // Query push subscriptions via identities table (hex pubkey → npub → push subs)
+    let subs = sqlx::query_as::<_, crate::db::PushSubscription>(
+        "SELECT ps.* FROM push_subscriptions ps
+         JOIN identities i ON i.npub = ps.npub
+         WHERE i.public_key = ?1"
+    )
+    .bind(to_pubkey)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    if subs.is_empty() {
+        tracing::debug!("[push] no subscriptions for pubkey {}", &to_pubkey[..8.min(to_pubkey.len())]);
+        return;
+    }
+
+    let payload = serde_json::json!({
+        "title": "📞 Incoming Ulendo Call",
+        "body":  format!("{} is calling you", caller_name),
+        "icon":  "/logo-icon.svg",
+        "badge": "/logo-icon.svg",
+        "tag":   "ulendo-call",
+        "requireInteraction": true,
+        "data":  { "type": "incoming_call", "from": to_pubkey }
+    });
+
+    for sub in &subs {
+        match state.push.send(sub, payload.to_string()).await {
+            Ok(_)  => tracing::info!("[push] call notification sent to {}", &to_pubkey[..8.min(to_pubkey.len())]),
+            Err(e) => tracing::warn!("[push] failed to send call notification: {e}"),
+        }
+    }
 }
 
 pub async fn online_drivers(
