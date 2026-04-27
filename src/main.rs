@@ -198,6 +198,7 @@ async fn main() -> Result<()> {
         .route("/escrow/:id/pickup",         post(routes::confirm::confirm_pickup))
         .route("/escrow/:id/cancel",         post(routes::confirm::cancel_before_pickup))
         .route("/escrow/:id/dispute",     post(routes::escrow::dispute))
+        .route("/escrow/release-direct",  post(routes::escrow::release_direct))
         .route("/escrow/:id/refund",      post(routes::escrow::refund))
         .route("/escrow/:id/complete",    post(routes::escrow::complete))
         // Push

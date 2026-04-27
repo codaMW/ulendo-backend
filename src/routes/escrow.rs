@@ -398,3 +398,35 @@ pub async fn complete(
         released_sats: 0,
     }))
 }
+
+// Direct payout from Ulendo escrow wallet — no booking required
+pub async fn release_direct(
+    auth: crate::auth::AuthUser,
+    State(state): State<crate::AppState>,
+    Json(body): Json<DirectReleaseRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let fee_sats = (body.amount_sats as u64 * state.cfg.escrow_fee_bps / 10_000) as i64;
+    let driver_sats = body.amount_sats - fee_sats;
+    if driver_sats < 100 {
+        return Err(AppError::BadRequest("amount too low for Lightning (min 100 sats after fee)".into()));
+    }
+    if !body.lud16.contains('@') {
+        return Err(AppError::BadRequest("invalid lud16 address".into()));
+    }
+    tracing::info!("[escrow] direct release: {} sats to {} (fee: {})", driver_sats, body.lud16, fee_sats);
+    state.blink.send_to_address(&body.lud16, driver_sats, &format!("Ulendo ride {}", body.ride_id)).await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blink payment failed: {e}")))?;
+    Ok(Json(serde_json::json!({
+        "status": "released",
+        "driver_sats": driver_sats,
+        "fee_sats": fee_sats,
+        "lud16": body.lud16,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct DirectReleaseRequest {
+    pub lud16: String,
+    pub amount_sats: i64,
+    pub ride_id: String,
+}
