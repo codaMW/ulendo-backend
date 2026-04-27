@@ -30,16 +30,19 @@ pub async fn create(
     State(state): State<AppState>,
     Json(body): Json<CreateBookingRequest>,
 ) -> AppResult<Json<Booking>> {
-    // Verify the listing exists
-    let listing_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM listings WHERE id = ?1 AND available = 1)"
-    )
-    .bind(&body.listing_id)
-    .fetch_one(&state.db)
-    .await?;
-
-    if !listing_exists {
-        return Err(AppError::NotFound(format!("listing {} not found", body.listing_id)));
+    // Verify the listing exists (skip for ride bookings)
+    let bt = body.booking_type.as_deref().unwrap_or("listing");
+    if bt != "ride" {
+        let listing_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM listings WHERE id = ?1 AND available = 1)"
+        )
+        .bind(&body.listing_id)
+        .fetch_one(&state.db)
+        .await?;
+        if !listing_exists {
+            return Err(AppError::NotFound(format!("listing {} not found", body.listing_id)));
+        }
+    }
     }
 
     // Validate amount
