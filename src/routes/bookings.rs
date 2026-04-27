@@ -43,7 +43,6 @@ pub async fn create(
             return Err(AppError::NotFound(format!("listing {} not found", body.listing_id)));
         }
     }
-    }
 
     // Validate amount
     if body.amount_sats < 1 {
