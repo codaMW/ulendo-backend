@@ -1,0 +1,356 @@
+use axum::{extract::State, Json};
+use serde::{Deserialize, Serialize};
+use crate::{AppState, auth::AuthUser, error::{AppError, AppResult}};
+
+// ─── GPS Heartbeat (called from ws.rs) ────────────────────────────────────
+#[derive(Deserialize, Debug)]
+pub struct GpsHeartbeat {
+    pub lat: f64,
+    pub lng: f64,
+    pub heading: Option<f64>,
+    pub speed_kmh: Option<f64>,
+    pub vehicle_type: Option<String>,
+    pub ride_categories: Option<String>,
+    pub seats: Option<i64>,
+    pub lud16: Option<String>,
+    pub display_name: Option<String>,
+    pub picture_url: Option<String>,
+    pub country: Option<String>,
+    pub city: Option<String>,
+}
+
+pub async fn upsert_driver_location(state: &AppState, pubkey: &str, hb: &GpsHeartbeat) {
+    let now = chrono::Utc::now().timestamp();
+    let _ = sqlx::query(
+        r#"INSERT INTO driver_locations
+           (pubkey, lat, lng, heading, speed_kmh, vehicle_type, ride_categories,
+            seats, lud16, display_name, picture_url, country, city, online, updated_at)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,1,?14)
+           ON CONFLICT(pubkey) DO UPDATE SET
+            lat=?2, lng=?3, heading=?4, speed_kmh=?5,
+            vehicle_type=COALESCE(?6, driver_locations.vehicle_type),
+            ride_categories=COALESCE(?7, driver_locations.ride_categories),
+            seats=COALESCE(?8, driver_locations.seats),
+            lud16=COALESCE(?9, driver_locations.lud16),
+            display_name=COALESCE(?10, driver_locations.display_name),
+            picture_url=COALESCE(?11, driver_locations.picture_url),
+            country=COALESCE(?12, driver_locations.country),
+            city=COALESCE(?13, driver_locations.city),
+            online=1, updated_at=?14"#
+    )
+    .bind(pubkey).bind(hb.lat).bind(hb.lng)
+    .bind(hb.heading).bind(hb.speed_kmh)
+    .bind(&hb.vehicle_type).bind(&hb.ride_categories)
+    .bind(hb.seats).bind(&hb.lud16)
+    .bind(&hb.display_name).bind(&hb.picture_url)
+    .bind(&hb.country).bind(&hb.city)
+    .bind(now)
+    .execute(&state.db)
+    .await;
+}
+
+pub async fn mark_driver_offline(state: &AppState, pubkey: &str) {
+    let _ = sqlx::query("UPDATE driver_locations SET online=0 WHERE pubkey=?1")
+        .bind(pubkey)
+        .execute(&state.db)
+        .await;
+}
+
+// ─── Ride Request: rider submits, backend finds nearest drivers ───────────
+#[derive(Deserialize)]
+pub struct RideRequestInput {
+    pub pickup_lat: f64,
+    pub pickup_lng: f64,
+    pub dest_lat: Option<f64>,
+    pub dest_lng: Option<f64>,
+    pub pickup_text: Option<String>,
+    pub dest_text: Option<String>,
+    pub vehicle_pref: Option<String>,
+    pub ride_category: Option<String>,
+    pub estimated_km: Option<f64>,
+    pub fare_sats: i64,
+}
+
+#[derive(Serialize)]
+pub struct RideRequestResponse {
+    pub ride_id: String,
+    pub status: String,
+    pub drivers_notified: i32,
+}
+
+pub async fn request_ride(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Json(body): Json<RideRequestInput>,
+) -> AppResult<Json<RideRequestResponse>> {
+    let ride_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let now = chrono::Utc::now().timestamp();
+    let category = body.ride_category.as_deref().unwrap_or("city");
+    let vehicle_pref = body.vehicle_pref.as_deref().unwrap_or("");
+
+    // Find nearest online drivers within radius (haversine approximation)
+    // 1 degree ≈ 111km. Start with ~15km radius for city, ~100km for intercity
+    let radius_deg = match category {
+        "intercity" => 1.0,
+        "tourist" => 2.0,
+        _ => 0.15, // ~15km for city
+    };
+
+    let drivers: Vec<(String,)> = sqlx::query_as(
+        r#"SELECT pubkey FROM driver_locations
+           WHERE online = 1
+             AND updated_at > ?1
+             AND ABS(lat - ?2) < ?4
+             AND ABS(lng - ?3) < ?4
+             AND (?5 = '' OR vehicle_type = ?5)
+             AND ride_categories LIKE '%' || ?6 || '%'
+             AND pubkey != ?7
+           ORDER BY ((lat - ?2)*(lat - ?2) + (lng - ?3)*(lng - ?3)) ASC
+           LIMIT 5"#
+    )
+    .bind(now - 120) // online within last 2 minutes
+    .bind(body.pickup_lat)
+    .bind(body.pickup_lng)
+    .bind(radius_deg)
+    .bind(vehicle_pref)
+    .bind(category)
+    .bind(&auth.public_key)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?;
+
+    let driver_pubkeys: Vec<String> = drivers.into_iter().map(|d| d.0).collect();
+    let notified_count = driver_pubkeys.len() as i32;
+    let drivers_json = serde_json::to_string(&driver_pubkeys).unwrap_or_default();
+
+    // Insert ride request
+    sqlx::query(
+        r#"INSERT INTO ride_requests
+           (id, rider_pubkey, rider_npub, pickup_lat, pickup_lng, dest_lat, dest_lng,
+            pickup_text, dest_text, vehicle_pref, ride_category, estimated_km,
+            fare_sats, status, drivers_notified, accept_deadline, round, created_at, updated_at)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'searching',?14,?15,1,?16,?16)"#
+    )
+    .bind(&ride_id)
+    .bind(&auth.public_key)
+    .bind(&auth.npub)
+    .bind(body.pickup_lat).bind(body.pickup_lng)
+    .bind(body.dest_lat).bind(body.dest_lng)
+    .bind(&body.pickup_text).bind(&body.dest_text)
+    .bind(vehicle_pref).bind(category)
+    .bind(body.estimated_km)
+    .bind(body.fare_sats)
+    .bind(&drivers_json)
+    .bind(now + 60) // 60 second accept window
+    .bind(now)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?;
+
+    // Notify each driver via WebSocket
+    for dpk in &driver_pubkeys {
+        let payload = serde_json::json!({
+            "type": "ulendo-ride-offer",
+            "rideId": ride_id,
+            "pickupLat": body.pickup_lat,
+            "pickupLng": body.pickup_lng,
+            "destLat": body.dest_lat,
+            "destLng": body.dest_lng,
+            "pickupText": body.pickup_text,
+            "destText": body.dest_text,
+            "fareSats": body.fare_sats,
+            "estimatedKm": body.estimated_km,
+            "category": category,
+            "riderPubkey": auth.public_key,
+        });
+        let msg = serde_json::json!({
+            "to": dpk,
+            "from": "server",
+            "type": "ulendo-ride-offer",
+            "payload": payload,
+        });
+        let reg = state.ws.lock().await;
+        if let Some(tx) = reg.get(dpk) {
+            let _ = tx.send(msg.to_string());
+        }
+        // Also send push notification
+        drop(reg);
+        let subs = sqlx::query_as::<_, crate::db::PushSubscription>(
+            "SELECT ps.* FROM push_subscriptions ps JOIN identities i ON i.npub = ps.npub WHERE i.public_key = ?1"
+        ).bind(dpk).fetch_all(&state.db).await.unwrap_or_default();
+        let push_payload = serde_json::json!({
+            "title": "🚗 New ride request!",
+            "body": format!("{} sats · {}", body.fare_sats, body.pickup_text.as_deref().unwrap_or("Nearby")),
+            "data": { "type": "ride_offer", "ride_id": ride_id },
+        });
+        for sub in &subs {
+            let _ = state.push.send(sub, push_payload.to_string()).await;
+        }
+    }
+
+    tracing::info!("[rides] request {} — notified {} drivers", &ride_id[..8], notified_count);
+
+    Ok(Json(RideRequestResponse {
+        ride_id,
+        status: if notified_count > 0 { "searching".into() } else { "no_drivers".into() },
+        drivers_notified: notified_count,
+    }))
+}
+
+// ─── Driver Accept: first driver to accept wins ───────────────────────────
+#[derive(Deserialize)]
+pub struct AcceptRideInput {
+    pub ride_id: String,
+}
+
+#[derive(Serialize)]
+pub struct AcceptRideResponse {
+    pub status: String,
+    pub ride_id: String,
+    pub rider_pubkey: String,
+    pub pickup_lat: f64,
+    pub pickup_lng: f64,
+    pub dest_lat: Option<f64>,
+    pub dest_lng: Option<f64>,
+    pub fare_sats: i64,
+}
+
+pub async fn accept_ride(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Json(body): Json<AcceptRideInput>,
+) -> AppResult<Json<AcceptRideResponse>> {
+    let now = chrono::Utc::now().timestamp();
+
+    // Atomic: only the first driver to accept gets the ride
+    let rows = sqlx::query(
+        "UPDATE ride_requests SET status='accepted', matched_driver=?1, updated_at=?2
+         WHERE id=?3 AND status='searching'"
+    )
+    .bind(&auth.public_key)
+    .bind(now)
+    .bind(&body.ride_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?;
+
+    if rows.rows_affected() == 0 {
+        return Err(AppError::BadRequest("Ride already taken or expired".into()));
+    }
+
+    // Fetch ride details
+    let ride: (String, f64, f64, Option<f64>, Option<f64>, i64, String) = sqlx::query_as(
+        "SELECT rider_pubkey, pickup_lat, pickup_lng, dest_lat, dest_lng, fare_sats, drivers_notified
+         FROM ride_requests WHERE id=?1"
+    )
+    .bind(&body.ride_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| AppError::NotFound("ride not found".into()))?;
+
+    let (rider_pk, plat, plng, dlat, dlng, fare, notified_json) = ride;
+
+    // Notify rider: "Driver found!"
+    let accept_msg = serde_json::json!({
+        "to": rider_pk,
+        "from": "server",
+        "type": "ulendo-ride-accepted",
+        "payload": {
+            "rideId": body.ride_id,
+            "driverPubkey": auth.public_key,
+            "fareSats": fare,
+        },
+    });
+    {
+        let reg = state.ws.lock().await;
+        if let Some(tx) = reg.get(&rider_pk) {
+            let _ = tx.send(accept_msg.to_string());
+        }
+    }
+
+    // Notify other drivers: "Ride taken"
+    let other_drivers: Vec<String> = serde_json::from_str(&notified_json).unwrap_or_default();
+    for dpk in &other_drivers {
+        if dpk == &auth.public_key { continue; }
+        let taken_msg = serde_json::json!({
+            "to": dpk,
+            "from": "server",
+            "type": "ulendo-ride-taken",
+            "payload": { "rideId": body.ride_id },
+        });
+        let reg = state.ws.lock().await;
+        if let Some(tx) = reg.get(dpk) {
+            let _ = tx.send(taken_msg.to_string());
+        }
+    }
+
+    tracing::info!("[rides] {} accepted by {}", &body.ride_id[..8], &auth.public_key[..8]);
+
+    Ok(Json(AcceptRideResponse {
+        status: "accepted".into(),
+        ride_id: body.ride_id,
+        rider_pubkey: rider_pk,
+        pickup_lat: plat,
+        pickup_lng: plng,
+        dest_lat: dlat,
+        dest_lng: dlng,
+        fare_sats: fare,
+    }))
+}
+
+// ─── Nearby Drivers: for the rider's map ──────────────────────────────────
+#[derive(Deserialize)]
+pub struct NearbyQuery {
+    pub lat: f64,
+    pub lng: f64,
+    pub radius_km: Option<f64>,
+    pub category: Option<String>,
+    pub vehicle_type: Option<String>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct NearbyDriver {
+    pub pubkey: String,
+    pub lat: f64,
+    pub lng: f64,
+    pub vehicle_type: String,
+    pub ride_categories: String,
+    pub seats: i64,
+    pub display_name: String,
+    pub picture_url: String,
+    pub lud16: String,
+}
+
+pub async fn nearby_drivers(
+    State(state): State<AppState>,
+    Json(body): Json<NearbyQuery>,
+) -> AppResult<Json<Vec<NearbyDriver>>> {
+    let now = chrono::Utc::now().timestamp();
+    let radius_deg = body.radius_km.unwrap_or(15.0) / 111.0;
+    let category = body.category.as_deref().unwrap_or("city");
+    let vtype = body.vehicle_type.as_deref().unwrap_or("");
+
+    let drivers = sqlx::query_as::<_, NearbyDriver>(
+        r#"SELECT pubkey, lat, lng, vehicle_type, ride_categories, seats,
+                  display_name, picture_url, lud16
+           FROM driver_locations
+           WHERE online = 1
+             AND updated_at > ?1
+             AND ABS(lat - ?2) < ?4
+             AND ABS(lng - ?3) < ?4
+             AND (?5 = '' OR vehicle_type = ?5)
+             AND ride_categories LIKE '%' || ?6 || '%'
+           ORDER BY ((lat - ?2)*(lat - ?2) + (lng - ?3)*(lng - ?3)) ASC
+           LIMIT 20"#
+    )
+    .bind(now - 120)
+    .bind(body.lat).bind(body.lng)
+    .bind(radius_deg)
+    .bind(vtype)
+    .bind(category)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?;
+
+    Ok(Json(drivers))
+}

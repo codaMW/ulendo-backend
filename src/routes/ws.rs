@@ -86,6 +86,21 @@ async fn handle_socket(socket: WebSocket, pubkey: String, state: crate::AppState
                     }
                     continue;
                 }
+                // Handle GPS heartbeat — update driver location
+                if text.contains("ulendo-gps-heartbeat") {
+                    if let Ok(hb) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(payload) = hb.get("payload") {
+                            if let Ok(gps) = serde_json::from_value::<crate::routes::rides::GpsHeartbeat>(payload.clone()) {
+                                let s = state_clone.clone();
+                                let p = pk.clone();
+                                tokio::spawn(async move {
+                                    crate::routes::rides::upsert_driver_location(&s, &p, &gps).await;
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if let Ok(mut envelope) = serde_json::from_str::<RideMessage>(&text) {
                     envelope.from = pk.clone();
                     let out = serde_json::to_string(&envelope).unwrap_or_default();
@@ -125,6 +140,8 @@ async fn handle_socket(socket: WebSocket, pubkey: String, state: crate::AppState
     }
 
     registry.lock().await.remove(&pubkey);
+    // Mark driver offline
+    crate::routes::rides::mark_driver_offline(&state, &pubkey).await;
     tracing::info!("[ws] {} disconnected", &pubkey[..8.min(pubkey.len())]);
 }
 

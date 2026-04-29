@@ -199,6 +199,10 @@ async fn main() -> Result<()> {
         .route("/escrow/:id/cancel",         post(routes::confirm::cancel_before_pickup))
         .route("/escrow/:id/dispute",     post(routes::escrow::dispute))
         .route("/escrow/release-direct",  post(routes::escrow::release_direct))
+        // Rides — driver discovery
+        .route("/rides/request",          post(routes::rides::request_ride))
+        .route("/rides/accept",           post(routes::rides::accept_ride))
+        .route("/rides/nearby",           post(routes::rides::nearby_drivers))
         .route("/escrow/:id/refund",      post(routes::escrow::refund))
         .route("/escrow/:id/complete",    post(routes::escrow::complete))
         // Push

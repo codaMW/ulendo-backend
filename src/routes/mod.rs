@@ -10,3 +10,4 @@ pub mod upload;
 pub mod verify;
 pub mod names;
 pub mod chessa;
+pub mod rides;
