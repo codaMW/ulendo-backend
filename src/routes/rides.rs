@@ -17,6 +17,7 @@ pub struct GpsHeartbeat {
     pub picture_url: Option<String>,
     pub country: Option<String>,
     pub city: Option<String>,
+    pub price_per_km: Option<i64>,
 }
 
 pub async fn upsert_driver_location(state: &AppState, pubkey: &str, hb: &GpsHeartbeat) {
@@ -24,8 +25,8 @@ pub async fn upsert_driver_location(state: &AppState, pubkey: &str, hb: &GpsHear
     let _ = sqlx::query(
         r#"INSERT INTO driver_locations
            (pubkey, lat, lng, heading, speed_kmh, vehicle_type, ride_categories,
-            seats, lud16, display_name, picture_url, country, city, online, updated_at)
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,1,?14)
+            seats, lud16, display_name, picture_url, country, city, online, updated_at, price_per_km)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,1,?14,?15)
            ON CONFLICT(pubkey) DO UPDATE SET
             lat=?2, lng=?3, heading=?4, speed_kmh=?5,
             vehicle_type=COALESCE(?6, driver_locations.vehicle_type),
@@ -36,7 +37,8 @@ pub async fn upsert_driver_location(state: &AppState, pubkey: &str, hb: &GpsHear
             picture_url=COALESCE(?11, driver_locations.picture_url),
             country=COALESCE(?12, driver_locations.country),
             city=COALESCE(?13, driver_locations.city),
-            online=1, updated_at=?14"#
+            online=1, updated_at=?14,
+            price_per_km=COALESCE(?15, driver_locations.price_per_km)"#
     )
     .bind(pubkey).bind(hb.lat).bind(hb.lng)
     .bind(hb.heading).bind(hb.speed_kmh)
@@ -44,7 +46,7 @@ pub async fn upsert_driver_location(state: &AppState, pubkey: &str, hb: &GpsHear
     .bind(hb.seats).bind(&hb.lud16)
     .bind(&hb.display_name).bind(&hb.picture_url)
     .bind(&hb.country).bind(&hb.city)
-    .bind(now)
+    .bind(now).bind(hb.price_per_km)
     .execute(&state.db)
     .await;
 }
@@ -319,6 +321,7 @@ pub struct NearbyDriver {
     pub display_name: String,
     pub picture_url: String,
     pub lud16: String,
+    pub price_per_km: i64,
 }
 
 pub async fn nearby_drivers(
@@ -332,7 +335,7 @@ pub async fn nearby_drivers(
 
     let drivers = sqlx::query_as::<_, NearbyDriver>(
         r#"SELECT pubkey, lat, lng, vehicle_type, ride_categories, seats,
-                  display_name, picture_url, lud16
+                  display_name, picture_url, lud16, price_per_km
            FROM driver_locations
            WHERE online = 1
              AND updated_at > ?1
