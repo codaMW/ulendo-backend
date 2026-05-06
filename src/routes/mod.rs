@@ -12,3 +12,4 @@ pub mod names;
 pub mod chessa;
 pub mod rides;
 pub mod ratings;
+pub mod fiat;

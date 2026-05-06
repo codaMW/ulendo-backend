@@ -2209,6 +2209,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
+
+[[package]]
 name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3368,6 +3374,7 @@ dependencies = [
  "nostr-sdk",
  "p256",
  "rand 0.8.5",
+ "regex-lite",
  "reqwest 0.11.27",
  "secp256k1",
  "serde",
