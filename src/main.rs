@@ -205,6 +205,8 @@ async fn main() -> Result<()> {
         .route("/rides/nearby",           post(routes::rides::nearby_drivers))
         .route("/rides/test-driver",      post(routes::rides::test_add_driver))
         .route("/rides/heartbeat",        post(routes::rides::http_heartbeat))
+        .route("/rides/notify",           post(routes::rides::http_send_booking))
+        .route("/rides/poll-bookings",    get(routes::rides::poll_bookings))
         .route("/ratings",                post(routes::ratings::submit_rating))
         .route("/ratings/driver/:pubkey", get(routes::ratings::get_driver_rating))
         .route("/ratings/reviews/:pubkey", get(routes::ratings::get_driver_ratings))

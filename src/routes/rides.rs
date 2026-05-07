@@ -396,3 +396,73 @@ pub async fn http_heartbeat(
     tracing::info!("[gps] HTTP heartbeat: {} at {},{}", &auth.public_key[..8], hb.lat, hb.lng);
     Ok(Json(serde_json::json!({"ok": true})))
 }
+
+// ─── HTTP booking notification (fallback when WS fails) ───────────────────
+#[derive(Deserialize)]
+pub struct HttpBookingNotify {
+    pub driver_pubkey: String,
+    pub ride_id: String,
+    pub pickup: Option<String>,
+    pub destination: Option<String>,
+    pub fare_sats: Option<i64>,
+    pub passenger_pubkey: Option<String>,
+    pub passenger_npub: Option<String>,
+}
+
+pub async fn http_send_booking(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Json(body): Json<HttpBookingNotify>,
+) -> AppResult<Json<serde_json::Value>> {
+    let msg = serde_json::json!({
+        "to": body.driver_pubkey,
+        "from": auth.public_key,
+        "type": "ulendo-booking-request",
+        "payload": {
+            "rideId": body.ride_id,
+            "pickup": body.pickup.unwrap_or_default(),
+            "destination": body.destination.unwrap_or_default(),
+            "fareSats": body.fare_sats.unwrap_or(0),
+            "passengerPubkey": body.passenger_pubkey.unwrap_or_default(),
+            "passengerNpub": body.passenger_npub.unwrap_or_default(),
+        }
+    });
+    // Try WS delivery
+    let mut delivered = false;
+    {
+        let reg = state.ws.lock().await;
+        if let Some(tx) = reg.get(&body.driver_pubkey) {
+            let _ = tx.send(msg.to_string());
+            delivered = true;
+            tracing::info!("[booking] HTTP→WS delivered to {}", &body.driver_pubkey[..8]);
+        }
+    }
+    // Store as pending notification
+    let _ = sqlx::query(
+        "INSERT OR REPLACE INTO ride_requests (id, rider_pubkey, matched_driver, pickup_lat, pickup_lng, fare_sats, status, created_at, category)
+         VALUES (?1, ?2, ?3, 0, 0, ?4, 'pending', ?5, 'city')"
+    )
+    .bind(&body.ride_id).bind(&auth.public_key).bind(&body.driver_pubkey)
+    .bind(body.fare_sats.unwrap_or(0))
+    .bind(chrono::Utc::now().timestamp())
+    .execute(&state.db).await;
+
+    Ok(Json(serde_json::json!({"ok": true, "ws_delivered": delivered})))
+}
+
+// ─── Driver polls for pending bookings ─────────────────────────────────────
+pub async fn poll_bookings(
+    auth: AuthUser,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<serde_json::Value>>> {
+    let rows = sqlx::query_as::<_, (String, String, i64, i64)>(
+        "SELECT id, rider_pubkey, fare_sats, created_at FROM ride_requests WHERE matched_driver=?1 AND status='pending' ORDER BY created_at DESC LIMIT 5"
+    )
+    .bind(&auth.public_key)
+    .fetch_all(&state.db).await
+    .unwrap_or_default();
+    let bookings: Vec<serde_json::Value> = rows.iter().map(|(id, rider, fare, ts)| {
+        serde_json::json!({"rideId": id, "riderPubkey": rider, "fareSats": fare, "createdAt": ts})
+    }).collect();
+    Ok(Json(bookings))
+}
