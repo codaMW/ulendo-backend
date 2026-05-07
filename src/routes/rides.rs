@@ -483,3 +483,37 @@ pub async fn poll_bookings(
     }).collect();
     Ok(Json(bookings))
 }
+
+#[derive(Deserialize)]
+pub struct AcceptBookingInput {
+    pub ride_id: String,
+    pub eta_min: Option<i64>,
+    pub fare_sats: Option<i64>,
+}
+
+pub async fn accept_booking_http(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Json(body): Json<AcceptBookingInput>,
+) -> AppResult<Json<serde_json::Value>> {
+    let _ = sqlx::query("UPDATE ride_requests SET status='accepted', matched_driver=?1 WHERE id=?2")
+        .bind(&auth.public_key).bind(&body.ride_id).execute(&state.db).await;
+    tracing::info!("[booking] driver {} accepted ride {}", &auth.public_key[..8], &body.ride_id);
+    Ok(Json(serde_json::json!({"ok": true, "ride_id": body.ride_id})))
+}
+
+pub async fn poll_ride_status(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    axum::extract::Path(ride_id): axum::extract::Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    let row: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT id, status, fare_sats FROM ride_requests WHERE id=?1 AND rider_pubkey=?2"
+    ).bind(&ride_id).bind(&auth.public_key)
+    .fetch_optional(&state.db).await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("{e}")))?;
+    match row {
+        Some((id, status, fare)) => Ok(Json(serde_json::json!({"ride_id": id, "status": status, "fare_sats": fare}))),
+        None => Ok(Json(serde_json::json!({"ride_id": ride_id, "status": "not_found"}))),
+    }
+}
