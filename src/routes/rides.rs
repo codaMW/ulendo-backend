@@ -471,8 +471,8 @@ pub async fn poll_bookings(
     // Proper per-driver filtering comes in Phase 2
     let cutoff = chrono::Utc::now().timestamp() - 300;
     tracing::info!("[poll] driver {} checking bookings since {}", &auth.public_key[..8], cutoff);
-    let rows = sqlx::query_as::<_, (String, String, i64, i64)>(
-        "SELECT id, rider_pubkey, fare_sats, created_at FROM ride_requests
+    let rows = sqlx::query_as::<_, (String, String, i64, i64, String, String)>(
+        "SELECT id, rider_pubkey, fare_sats, created_at, COALESCE(pickup,''), COALESCE(destination,'') FROM ride_requests
          WHERE status='pending' AND created_at > ?1
          ORDER BY created_at DESC LIMIT 5"
     )
@@ -480,8 +480,8 @@ pub async fn poll_bookings(
     .fetch_all(&state.db).await
     .unwrap_or_default();
     tracing::info!("[poll] found {} pending bookings", rows.len());
-    let bookings: Vec<serde_json::Value> = rows.iter().map(|(id, rider, fare, ts)| {
-        serde_json::json!({"rideId": id, "riderPubkey": rider, "fareSats": fare, "createdAt": ts})
+    let bookings: Vec<serde_json::Value> = rows.iter().map(|(id, rider, fare, ts, pickup, dest)| {
+        serde_json::json!({"rideId": id, "riderPubkey": rider, "fareSats": fare, "createdAt": ts, "pickup": pickup, "destination": dest})
     }).collect();
     Ok(Json(bookings))
 }
