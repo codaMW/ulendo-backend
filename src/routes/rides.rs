@@ -467,17 +467,19 @@ pub async fn poll_bookings(
     auth: AuthUser,
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<serde_json::Value>>> {
-    // Check both the auth pubkey AND any driver_locations pubkey that matches this user
+    // For launch: return all recent pending bookings for any online driver
+    // Proper per-driver filtering comes in Phase 2
+    let cutoff = chrono::Utc::now().timestamp() - 300;
+    tracing::info!("[poll] driver {} checking bookings since {}", &auth.public_key[..8], cutoff);
     let rows = sqlx::query_as::<_, (String, String, i64, i64)>(
         "SELECT id, rider_pubkey, fare_sats, created_at FROM ride_requests
-         WHERE (matched_driver=?1 OR matched_driver IN (SELECT pubkey FROM driver_locations WHERE pubkey=?1))
-         AND status='pending' AND created_at > ?2
+         WHERE status='pending' AND created_at > ?1
          ORDER BY created_at DESC LIMIT 5"
     )
-    .bind(&auth.public_key)
-    .bind(chrono::Utc::now().timestamp() - 300) // only last 5 minutes
+    .bind(cutoff)
     .fetch_all(&state.db).await
     .unwrap_or_default();
+    tracing::info!("[poll] found {} pending bookings", rows.len());
     let bookings: Vec<serde_json::Value> = rows.iter().map(|(id, rider, fare, ts)| {
         serde_json::json!({"rideId": id, "riderPubkey": rider, "fareSats": fare, "createdAt": ts})
     }).collect();
