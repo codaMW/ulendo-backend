@@ -219,11 +219,8 @@ async fn send_booking_push(state: &crate::AppState, to_pubkey: &str, pickup: &st
     let body = if !pickup.is_empty() && !dest.is_empty() { format!("{} -> {}", pickup, dest) }
         else { "New ride request".to_string() };
     let payload = serde_json::json!({"title":"New Ride Request!","body":body,"icon":"/logo-icon.svg","data":{"action":"booking"}});
-    { let push = &state.push;
-        for sub in &subs { let _ = push.send(sub, payload.to_string()).await; }
-        tracing::info!("[push] booking push sent to {} ({} subs)", &to_pubkey[..8], subs.len());
-    }
-    }
+    for sub in &subs { let _ = state.push.send(sub, payload.to_string()).await; }
+    tracing::info!("[push] booking push sent to {} ({} subs)", &to_pubkey[..8], subs.len());
 }
 
 pub async fn online_drivers(
