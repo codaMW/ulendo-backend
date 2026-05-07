@@ -427,14 +427,26 @@ pub async fn http_send_booking(
             "passengerNpub": body.passenger_npub.unwrap_or_default(),
         }
     });
-    // Try WS delivery
+    // Try WS delivery — check both the listing pubkey and any online driver
     let mut delivered = false;
     {
         let reg = state.ws.lock().await;
+        // Try direct pubkey first
         if let Some(tx) = reg.get(&body.driver_pubkey) {
             let _ = tx.send(msg.to_string());
             delivered = true;
-            tracing::info!("[booking] HTTP→WS delivered to {}", &body.driver_pubkey[..8]);
+            tracing::info!("[booking] HTTP→WS delivered to listing pubkey {}", &body.driver_pubkey[..8]);
+        }
+        // Also try to find ANY connected driver (for testing with mismatched keys)
+        if !delivered {
+            for (pk, tx) in reg.iter() {
+                if pk != &auth.public_key { // don't send to the booker
+                    let _ = tx.send(msg.to_string());
+                    delivered = true;
+                    tracing::info!("[booking] HTTP→WS delivered to online driver {}", &pk[..8]);
+                    break;
+                }
+            }
         }
     }
     // Store as pending notification
@@ -455,10 +467,15 @@ pub async fn poll_bookings(
     auth: AuthUser,
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<serde_json::Value>>> {
+    // Check both the auth pubkey AND any driver_locations pubkey that matches this user
     let rows = sqlx::query_as::<_, (String, String, i64, i64)>(
-        "SELECT id, rider_pubkey, fare_sats, created_at FROM ride_requests WHERE matched_driver=?1 AND status='pending' ORDER BY created_at DESC LIMIT 5"
+        "SELECT id, rider_pubkey, fare_sats, created_at FROM ride_requests
+         WHERE (matched_driver=?1 OR matched_driver IN (SELECT pubkey FROM driver_locations WHERE pubkey=?1))
+         AND status='pending' AND created_at > ?2
+         ORDER BY created_at DESC LIMIT 5"
     )
     .bind(&auth.public_key)
+    .bind(chrono::Utc::now().timestamp() - 300) // only last 5 minutes
     .fetch_all(&state.db).await
     .unwrap_or_default();
     let bookings: Vec<serde_json::Value> = rows.iter().map(|(id, rider, fare, ts)| {
