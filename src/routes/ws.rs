@@ -115,21 +115,42 @@ async fn handle_socket(socket: WebSocket, pubkey: String, state: crate::AppState
                     envelope.from = pk.clone();
                     let out = serde_json::to_string(&envelope).unwrap_or_default();
                     let is_call_offer = envelope.msg_type == "ulendo-call-offer";
+                    let is_booking = envelope.msg_type == "ulendo-booking-request";
                     let to_pubkey = envelope.to.clone();
                     let caller_name = envelope.payload
                         .get("callerName").and_then(|v| v.as_str())
                         .unwrap_or("Someone").to_string();
+                    let pickup_text = envelope.payload
+                        .get("pickup").and_then(|v| v.as_str())
+                        .unwrap_or("").to_string();
+                    let dest_text = envelope.payload
+                        .get("destination").and_then(|v| v.as_str())
+                        .unwrap_or("").to_string();
                     {
                         let reg = reg_clone.lock().await;
                         if let Some(tx) = reg.get(&envelope.to) {
-                            let _ = tx.send(out);
-                        } else if is_call_offer {
-                            // Recipient offline — send Web Push
+                            let _ = tx.send(out.clone());
+                            tracing::info!("[ws] delivered {} to {}", envelope.msg_type, &envelope.to[..8]);
+                        } else {
+                            tracing::info!("[ws] {} offline for {}", &envelope.to[..8], envelope.msg_type);
+                        }
+                        if is_call_offer && !reg.contains_key(&envelope.to) {
+                            // Recipient offline — send Web Push for call
                             let state_clone = state_clone.clone();
                             let caller = caller_name.clone();
                             let to = to_pubkey.clone();
                             tokio::spawn(async move {
                                 send_call_push(&state_clone, &to, &caller).await;
+                            });
+                        }
+                        if is_booking && !reg.contains_key(&to_pubkey) {
+                            // Driver offline — send Web Push for booking
+                            let state_clone2 = state_clone.clone();
+                            let to2 = to_pubkey.clone();
+                            let pickup = pickup_text.clone();
+                            let dest = dest_text.clone();
+                            tokio::spawn(async move {
+                                send_booking_push(&state_clone2, &to2, &pickup, &dest).await;
                             });
                         }
                         if let Some(tx) = reg.get(&pk) {
