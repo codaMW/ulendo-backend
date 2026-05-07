@@ -385,3 +385,14 @@ pub async fn test_add_driver(
     upsert_driver_location(&state, &body.pubkey, &hb).await;
     Ok(Json(serde_json::json!({"ok": true, "pubkey": body.pubkey, "lat": body.lat, "lng": body.lng})))
 }
+
+// ─── HTTP Heartbeat (REST fallback for mobile) ────────────────────────────
+pub async fn http_heartbeat(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Json(hb): Json<GpsHeartbeat>,
+) -> AppResult<Json<serde_json::Value>> {
+    upsert_driver_location(&state, &auth.public_key, &hb).await;
+    tracing::info!("[gps] HTTP heartbeat: {} at {},{}", &auth.public_key[..8], hb.lat, hb.lng);
+    Ok(Json(serde_json::json!({"ok": true})))
+}
