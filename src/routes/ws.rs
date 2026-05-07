@@ -211,6 +211,20 @@ async fn send_call_push(state: &crate::AppState, to_pubkey: &str, caller_name: &
     }
 }
 
+async fn send_booking_push(state: &crate::AppState, to_pubkey: &str, pickup: &str, dest: &str) {
+    let subs = sqlx::query_as::<_, crate::db::PushSubscription>(
+        "SELECT ps.* FROM push_subscriptions ps JOIN identities i ON i.npub = ps.npub WHERE i.public_key = ?1"
+    ).bind(to_pubkey).fetch_all(&state.db).await.unwrap_or_default();
+    if subs.is_empty() { tracing::debug!("[push] no booking subs for {}", &to_pubkey[..8]); return; }
+    let body = if !pickup.is_empty() && !dest.is_empty() { format!("{} -> {}", pickup, dest) }
+        else { "New ride request".to_string() };
+    let payload = serde_json::json!({"title":"New Ride Request!","body":body,"icon":"/logo-icon.svg","data":{"action":"booking"}});
+    if let Some(push) = &state.push {
+        for sub in &subs { let _ = push.send(sub, payload.to_string()).await; }
+        tracing::info!("[push] booking push sent to {} ({} subs)", &to_pubkey[..8], subs.len());
+    }
+}
+
 pub async fn online_drivers(
     State(state): State<crate::AppState>,
 ) -> axum::Json<Vec<String>> {
