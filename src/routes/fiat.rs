@@ -5,7 +5,7 @@ use crate::{AppState, auth::AuthUser, error::{AppError, AppResult}};
 const FIAT_COMMISSION_PCT: i64 = 13;
 
 fn ulendo_airtel() -> String {
-    std::env::var("ULENDO_AIRTEL_NUMBER").unwrap_or_else(|_| "+265991234567".into())
+    std::env::var("ULENDO_AIRTEL_NUMBER").unwrap_or_else(|_| "+265996972986".into())
 }
 fn ulendo_tnm() -> String {
     std::env::var("ULENDO_TNM_NUMBER").unwrap_or_else(|_| "+265881234567".into())
