@@ -357,3 +357,31 @@ pub async fn nearby_drivers(
 
     Ok(Json(drivers))
 }
+
+// ─── Debug: manually register a test driver location ───────────────────────
+#[derive(Deserialize)]
+pub struct TestDriverInput {
+    pub pubkey: String,
+    pub lat: f64,
+    pub lng: f64,
+    pub name: Option<String>,
+    pub vehicle_type: Option<String>,
+}
+
+pub async fn test_add_driver(
+    State(state): State<AppState>,
+    Json(body): Json<TestDriverInput>,
+) -> AppResult<Json<serde_json::Value>> {
+    let hb = GpsHeartbeat {
+        lat: body.lat, lng: body.lng,
+        heading: None, speed_kmh: None,
+        vehicle_type: body.vehicle_type.or(Some("sedan".into())),
+        ride_categories: Some("city".into()),
+        seats: Some(4), lud16: Some("".into()),
+        display_name: body.name.or(Some("Test Driver".into())),
+        picture_url: None, country: None, city: None,
+        price_per_km: Some(500),
+    };
+    upsert_driver_location(&state, &body.pubkey, &hb).await;
+    Ok(Json(serde_json::json!({"ok": true, "pubkey": body.pubkey, "lat": body.lat, "lng": body.lng})))
+}

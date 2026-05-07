@@ -88,16 +88,26 @@ async fn handle_socket(socket: WebSocket, pubkey: String, state: crate::AppState
                 }
                 // Handle GPS heartbeat — update driver location
                 if text.contains("ulendo-gps-heartbeat") {
-                    if let Ok(hb) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(payload) = hb.get("payload") {
-                            if let Ok(gps) = serde_json::from_value::<crate::routes::rides::GpsHeartbeat>(payload.clone()) {
-                                let s = state_clone.clone();
-                                let p = pk.clone();
-                                tokio::spawn(async move {
-                                    crate::routes::rides::upsert_driver_location(&s, &p, &gps).await;
-                                });
+                    tracing::info!("[ws] GPS heartbeat from {}", &pk[..8]);
+                    match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(hb) => {
+                            if let Some(payload) = hb.get("payload") {
+                                match serde_json::from_value::<crate::routes::rides::GpsHeartbeat>(payload.clone()) {
+                                    Ok(gps) => {
+                                        tracing::info!("[ws] GPS parsed: lat={}, lng={}", gps.lat, gps.lng);
+                                        let s = state_clone.clone();
+                                        let p = pk.clone();
+                                        tokio::spawn(async move {
+                                            crate::routes::rides::upsert_driver_location(&s, &p, &gps).await;
+                                        });
+                                    }
+                                    Err(e) => tracing::warn!("[ws] GPS parse FAILED: {}", e),
+                                }
+                            } else {
+                                tracing::warn!("[ws] GPS heartbeat missing payload field");
                             }
                         }
+                        Err(e) => tracing::warn!("[ws] GPS JSON parse failed: {}", e),
                     }
                     continue;
                 }
