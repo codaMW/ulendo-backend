@@ -414,6 +414,34 @@ pub async fn http_send_booking(
     State(state): State<AppState>,
     Json(body): Json<HttpBookingNotify>,
 ) -> AppResult<Json<serde_json::Value>> {
+    // Store booking in ride_requests so the matched driver can poll for it
+    let now = chrono::Utc::now().timestamp();
+    let pickup_text = body.pickup.clone().unwrap_or_default();
+    let dest_text = body.destination.clone().unwrap_or_default();
+    let fare = body.fare_sats.unwrap_or(0);
+    let insert_result = sqlx::query(
+        "INSERT INTO ride_requests
+         (id, rider_pubkey, rider_npub, pickup_lat, pickup_lng, pickup_text, dest_text,
+          fare_sats, status, matched_driver, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 0, 0, ?4, ?5, ?6, 'pending', ?7, ?8, ?8)
+         ON CONFLICT(id) DO UPDATE SET
+           matched_driver = ?7, status = 'pending', updated_at = ?8"
+    )
+    .bind(&body.ride_id)
+    .bind(&auth.public_key)
+    .bind(body.passenger_npub.as_deref().unwrap_or(""))
+    .bind(&pickup_text)
+    .bind(&dest_text)
+    .bind(fare)
+    .bind(&body.driver_pubkey)
+    .bind(now)
+    .execute(&state.db).await;
+
+    match &insert_result {
+        Ok(_) => tracing::info!("[booking] stored ride {} for driver {}", &body.ride_id, &body.driver_pubkey[..8]),
+        Err(e) => tracing::error!("[booking] DB insert failed: {}", e),
+    }
+
     let msg = serde_json::json!({
         "to": body.driver_pubkey,
         "from": auth.public_key,
@@ -427,37 +455,18 @@ pub async fn http_send_booking(
             "passengerNpub": body.passenger_npub.unwrap_or_default(),
         }
     });
-    // Try WS delivery — check both the listing pubkey and any online driver
+    // Try WS delivery to the matched driver only
     let mut delivered = false;
     {
         let reg = state.ws.lock().await;
-        // Try direct pubkey first
         if let Some(tx) = reg.get(&body.driver_pubkey) {
             let _ = tx.send(msg.to_string());
             delivered = true;
-            tracing::info!("[booking] HTTP→WS delivered to listing pubkey {}", &body.driver_pubkey[..8]);
-        }
-        // Also try to find ANY connected driver (for testing with mismatched keys)
-        if !delivered {
-            for (pk, tx) in reg.iter() {
-                if pk != &auth.public_key { // don't send to the booker
-                    let _ = tx.send(msg.to_string());
-                    delivered = true;
-                    tracing::info!("[booking] HTTP→WS delivered to online driver {}", &pk[..8]);
-                    break;
-                }
-            }
+            tracing::info!("[booking] WS delivered to driver {}", &body.driver_pubkey[..8]);
+        } else {
+            tracing::info!("[booking] driver {} not on WS, will rely on HTTP poll", &body.driver_pubkey[..8]);
         }
     }
-    // Store as pending notification
-    let _ = sqlx::query(
-        "INSERT OR REPLACE INTO ride_requests (id, rider_pubkey, matched_driver, pickup_lat, pickup_lng, fare_sats, status, created_at, category)
-         VALUES (?1, ?2, ?3, 0, 0, ?4, 'pending', ?5, 'city')"
-    )
-    .bind(&body.ride_id).bind(&auth.public_key).bind(&body.driver_pubkey)
-    .bind(body.fare_sats.unwrap_or(0))
-    .bind(chrono::Utc::now().timestamp())
-    .execute(&state.db).await;
 
     Ok(Json(serde_json::json!({"ok": true, "ws_delivered": delivered})))
 }
@@ -467,19 +476,22 @@ pub async fn poll_bookings(
     auth: AuthUser,
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<serde_json::Value>>> {
-    // For launch: return all recent pending bookings for any online driver
-    // Proper per-driver filtering comes in Phase 2
     let cutoff = chrono::Utc::now().timestamp() - 300;
-    tracing::info!("[poll] driver {} checking bookings since {}", &auth.public_key[..8], cutoff);
+    tracing::info!("[poll] driver {} polling since {}", &auth.public_key[..8], cutoff);
     let rows = sqlx::query_as::<_, (String, String, i64, i64, String, String)>(
-        "SELECT id, rider_pubkey, fare_sats, created_at, COALESCE(pickup,''), COALESCE(destination,'') FROM ride_requests
-         WHERE status='pending' AND created_at > ?1
+        "SELECT id, rider_pubkey, fare_sats, created_at, pickup_text, dest_text
+         FROM ride_requests
+         WHERE status = 'pending'
+           AND matched_driver = ?1
+           AND created_at > ?2
          ORDER BY created_at DESC LIMIT 5"
     )
+    .bind(&auth.public_key)
     .bind(cutoff)
     .fetch_all(&state.db).await
+    .map_err(|e| { tracing::error!("[poll] DB query failed: {}", e); e })
     .unwrap_or_default();
-    tracing::info!("[poll] found {} pending bookings", rows.len());
+    tracing::info!("[poll] driver {} found {} bookings", &auth.public_key[..8], rows.len());
     let bookings: Vec<serde_json::Value> = rows.iter().map(|(id, rider, fare, ts, pickup, dest)| {
         serde_json::json!({"rideId": id, "riderPubkey": rider, "fareSats": fare, "createdAt": ts, "pickup": pickup, "destination": dest})
     }).collect();
