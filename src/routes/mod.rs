@@ -13,3 +13,4 @@ pub mod chessa;
 pub mod rides;
 pub mod ratings;
 pub mod fiat;
+pub mod driver_listings;

@@ -199,6 +199,10 @@ async fn main() -> Result<()> {
         .route("/escrow/:id/cancel",         post(routes::confirm::cancel_before_pickup))
         .route("/escrow/:id/dispute",     post(routes::escrow::dispute))
         .route("/escrow/release-direct",  post(routes::escrow::release_direct))
+        .route("/listings/driver",                post(routes::driver_listings::upsert))
+        .route("/listings/driver/mine",           get(routes::driver_listings::list_mine))
+        .route("/listings/driver/:id",            delete(routes::driver_listings::delete_one))
+        .route("/rides/nearby-listings",          get(routes::driver_listings::nearby_listings))
         .route("/escrow/direct-release-status/:ride_id", axum::routing::get(routes::escrow::direct_release_status))
         // Rides — driver discovery
         .route("/rides/request",          post(routes::rides::request_ride))
