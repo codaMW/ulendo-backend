@@ -456,6 +456,13 @@ pub async fn release_direct(
             )
             .bind(&blink_status).bind(now2).bind(&release_id)
             .execute(&state.db).await?;
+            // Mark the ride as completed so the driver becomes discoverable to new bookers again.
+            // (nearby_drivers excludes drivers with status IN ('accepted','in_progress','funded'))
+            let _ = sqlx::query(
+                "UPDATE ride_requests SET status='completed', updated_at=?1 WHERE id=?2"
+            )
+            .bind(now2).bind(&body.ride_id)
+            .execute(&state.db).await;
             Ok(Json(serde_json::json!({
                 "status": "released",
                 "driver_sats": driver_sats,
