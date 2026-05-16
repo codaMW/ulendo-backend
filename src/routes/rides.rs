@@ -333,17 +333,25 @@ pub async fn nearby_drivers(
     let category = body.category.as_deref().unwrap_or("city");
     let vtype = body.vehicle_type.as_deref().unwrap_or("");
 
+    // Drivers with an active ride (accepted/in_progress/funded) are NOT available.
+    // Excluded via NOT IN subquery against ride_requests.
     let drivers = sqlx::query_as::<_, NearbyDriver>(
-        r#"SELECT pubkey, lat, lng, vehicle_type, ride_categories, seats,
-                  display_name, picture_url, lud16, price_per_km
-           FROM driver_locations
-           WHERE online = 1
-             AND updated_at > ?1
-             AND ABS(lat - ?2) < ?4
-             AND ABS(lng - ?3) < ?4
-             AND (?5 = '' OR vehicle_type = ?5)
-             AND ride_categories LIKE '%' || ?6 || '%'
-           ORDER BY ((lat - ?2)*(lat - ?2) + (lng - ?3)*(lng - ?3)) ASC
+        r#"SELECT dl.pubkey, dl.lat, dl.lng, dl.vehicle_type, dl.ride_categories, dl.seats,
+                  dl.display_name, dl.picture_url, dl.lud16, dl.price_per_km
+           FROM driver_locations dl
+           WHERE dl.online = 1
+             AND dl.updated_at > ?1
+             AND ABS(dl.lat - ?2) < ?4
+             AND ABS(dl.lng - ?3) < ?4
+             AND (?5 = '' OR dl.vehicle_type = ?5)
+             AND dl.ride_categories LIKE '%' || ?6 || '%'
+             AND dl.pubkey NOT IN (
+               SELECT matched_driver FROM ride_requests
+               WHERE matched_driver IS NOT NULL
+                 AND status IN ('accepted', 'in_progress', 'funded')
+                 AND updated_at > ?7
+             )
+           ORDER BY ((dl.lat - ?2)*(dl.lat - ?2) + (dl.lng - ?3)*(dl.lng - ?3)) ASC
            LIMIT 20"#
     )
     .bind(now - 120)
@@ -351,6 +359,7 @@ pub async fn nearby_drivers(
     .bind(radius_deg)
     .bind(vtype)
     .bind(category)
+    .bind(now - 7200)  // ?7: ignore stale active rides older than 2 hours
     .fetch_all(&state.db)
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?;
