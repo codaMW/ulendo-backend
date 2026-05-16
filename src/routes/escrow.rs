@@ -407,21 +407,110 @@ pub async fn release_direct(
 ) -> AppResult<Json<serde_json::Value>> {
     let fee_sats = (body.amount_sats as u64 * state.cfg.escrow_fee_bps / 10_000) as i64;
     let driver_sats = body.amount_sats - fee_sats;
+    let now = chrono::Utc::now().timestamp();
+    let release_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+
+    // Validate up front. If we fail, write a `failed` row so driver poll can show real error.
     if driver_sats < 100 {
-        return Err(AppError::BadRequest("amount too low for Lightning (min 100 sats after fee)".into()));
+        let msg = format!("amount too low for Lightning (min 100 sats after fee, requested {} sats)", driver_sats);
+        let _ = sqlx::query(
+            "INSERT INTO direct_releases (id, ride_id, payer_pubkey, lud16, amount_sats, driver_sats, fee_sats, status, error_message, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'failed', ?8, ?9, ?9)"
+        )
+        .bind(&release_id).bind(&body.ride_id).bind(&auth.public_key).bind(&body.lud16)
+        .bind(body.amount_sats).bind(driver_sats).bind(fee_sats).bind(&msg).bind(now)
+        .execute(&state.db).await;
+        return Err(AppError::BadRequest(msg));
     }
     if !body.lud16.contains('@') {
-        return Err(AppError::BadRequest("invalid lud16 address".into()));
+        let msg = "invalid lud16 address".to_string();
+        let _ = sqlx::query(
+            "INSERT INTO direct_releases (id, ride_id, payer_pubkey, lud16, amount_sats, driver_sats, fee_sats, status, error_message, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'failed', ?8, ?9, ?9)"
+        )
+        .bind(&release_id).bind(&body.ride_id).bind(&auth.public_key).bind(&body.lud16)
+        .bind(body.amount_sats).bind(driver_sats).bind(fee_sats).bind(&msg).bind(now)
+        .execute(&state.db).await;
+        return Err(AppError::BadRequest(msg));
     }
+
+    // Insert pending row BEFORE calling Blink so driver can poll immediately
+    sqlx::query(
+        "INSERT INTO direct_releases (id, ride_id, payer_pubkey, lud16, amount_sats, driver_sats, fee_sats, status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?8)"
+    )
+    .bind(&release_id).bind(&body.ride_id).bind(&auth.public_key).bind(&body.lud16)
+    .bind(body.amount_sats).bind(driver_sats).bind(fee_sats).bind(now)
+    .execute(&state.db).await?;
+
     tracing::info!("[escrow] direct release: {} sats to {} (fee: {})", driver_sats, body.lud16, fee_sats);
-    state.blink.send_to_address(&body.lud16, driver_sats, &format!("Ulendo ride {}", body.ride_id)).await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blink payment failed: {e}")))?;
-    Ok(Json(serde_json::json!({
-        "status": "released",
-        "driver_sats": driver_sats,
-        "fee_sats": fee_sats,
-        "lud16": body.lud16,
-    })))
+
+    // Call Blink
+    let blink_result = state.blink.send_to_address(&body.lud16, driver_sats, &format!("Ulendo ride {}", body.ride_id)).await;
+    let now2 = chrono::Utc::now().timestamp();
+
+    match blink_result {
+        Ok(blink_status) => {
+            sqlx::query(
+                "UPDATE direct_releases SET status='released', blink_status=?1, updated_at=?2 WHERE id=?3"
+            )
+            .bind(&blink_status).bind(now2).bind(&release_id)
+            .execute(&state.db).await?;
+            Ok(Json(serde_json::json!({
+                "status": "released",
+                "driver_sats": driver_sats,
+                "fee_sats": fee_sats,
+                "lud16": body.lud16,
+                "release_id": release_id,
+                "blink_status": blink_status,
+            })))
+        }
+        Err(e) => {
+            let err_msg = format!("Blink payment failed: {e}");
+            sqlx::query(
+                "UPDATE direct_releases SET status='failed', error_message=?1, updated_at=?2 WHERE id=?3"
+            )
+            .bind(&err_msg).bind(now2).bind(&release_id)
+            .execute(&state.db).await?;
+            Err(AppError::Internal(anyhow::anyhow!("{}", err_msg)))
+        }
+    }
+}
+
+// Driver polls this to learn current payout state for a ride.
+// Returns the most recent direct_release row for the given ride_id.
+pub async fn direct_release_status(
+    _auth: crate::auth::AuthUser,
+    axum::extract::Path(ride_id): axum::extract::Path<String>,
+    State(state): State<crate::AppState>,
+) -> AppResult<Json<serde_json::Value>> {
+    let row: Option<(String, String, String, i64, i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, status, lud16, amount_sats, driver_sats, fee_sats, error_message, blink_status
+         FROM direct_releases WHERE ride_id = ?1
+         ORDER BY created_at DESC LIMIT 1"
+    )
+    .bind(&ride_id)
+    .fetch_optional(&state.db).await?;
+
+    match row {
+        Some((id, status, lud16, amount_sats, driver_sats, fee_sats, error_message, blink_status)) => {
+            Ok(Json(serde_json::json!({
+                "release_id": id,
+                "ride_id": ride_id,
+                "status": status,
+                "lud16": lud16,
+                "amount_sats": amount_sats,
+                "driver_sats": driver_sats,
+                "fee_sats": fee_sats,
+                "error_message": error_message,
+                "blink_status": blink_status,
+            })))
+        }
+        None => Ok(Json(serde_json::json!({
+            "ride_id": ride_id,
+            "status": "no_release_yet",
+        }))),
+    }
 }
 
 #[derive(serde::Deserialize)]
