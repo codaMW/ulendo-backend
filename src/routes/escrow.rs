@@ -503,13 +503,19 @@ pub async fn release_direct(
             })))
         }
         Err(e) => {
-            let err_msg = format!("Blink payment failed: {e}");
+            // Surface Blink's actual error to the booker so they know it's
+            // a payment-network issue (e.g. destination unreachable, insufficient
+            // balance, rate limited) rather than just "internal server error".
+            let err_msg = format!("Lightning payment failed: {e}");
+            tracing::error!("[escrow] Blink failure for ride={}: {}", &body.ride_id, &err_msg);
             sqlx::query(
                 "UPDATE direct_releases SET status='failed', error_message=?1, updated_at=?2 WHERE id=?3"
             )
             .bind(&err_msg).bind(now2).bind(&release_id)
             .execute(&state.db).await?;
-            Err(AppError::Internal(anyhow::anyhow!("{}", err_msg)))
+            // Return BadRequest (not Internal) so the booker sees the actual reason
+            // rather than "internal server error". This is a payment failure, not a server bug.
+            Err(AppError::BadRequest(err_msg))
         }
     }
 }
