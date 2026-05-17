@@ -10,40 +10,43 @@ const MAX_LISTINGS_PER_DRIVER: i64 = 5;
 
 #[derive(Deserialize, Debug)]
 pub struct UpsertDriverListing {
-    pub id:               String,
-    pub listing_name:     Option<String>,
-    pub vehicle:          Option<String>,
-    pub vehicle_type:     Option<String>,
-    pub seats:            Option<i64>,
-    pub price_per_km:     Option<i64>,
-    pub ride_categories:  Option<String>,
-    pub photo_urls:       Option<String>,   // JSON array, stored as text
-    pub description:      Option<String>,
-    pub location_country: Option<String>,
-    pub location_city:    Option<String>,
-    pub lud16:            Option<String>,
-    pub nostr_event_id:   Option<String>,
+    pub id:                  String,
+    pub listing_name:        Option<String>,
+    pub vehicle:             Option<String>,
+    pub vehicle_type:        Option<String>,
+    pub seats:               Option<i64>,
+    pub price_per_km:        Option<i64>,
+    pub ride_categories:     Option<String>,
+    pub photo_urls:          Option<String>,
+    pub description:         Option<String>,
+    pub location_country:    Option<String>,
+    pub location_city:       Option<String>,
+    pub lud16:               Option<String>,
+    pub nostr_event_id:      Option<String>,
+    pub service_interval_km: Option<i64>,   // default 5000 if not set
 }
 
 #[derive(Serialize, Deserialize, FromRow, Debug)]
 pub struct DriverListingRow {
-    pub id:               String,
-    pub driver_pubkey:    String,
-    pub driver_npub:      Option<String>,
-    pub listing_name:     Option<String>,
-    pub vehicle:          Option<String>,
-    pub vehicle_type:     Option<String>,
-    pub seats:            Option<i64>,
-    pub price_per_km:     Option<i64>,
-    pub ride_categories:  Option<String>,
-    pub photo_urls:       Option<String>,
-    pub description:      Option<String>,
-    pub location_country: Option<String>,
-    pub location_city:    Option<String>,
-    pub lud16:            Option<String>,
-    pub nostr_event_id:   Option<String>,
-    pub created_at:       i64,
-    pub updated_at:       i64,
+    pub id:                  String,
+    pub driver_pubkey:       String,
+    pub driver_npub:         Option<String>,
+    pub listing_name:        Option<String>,
+    pub vehicle:             Option<String>,
+    pub vehicle_type:        Option<String>,
+    pub seats:               Option<i64>,
+    pub price_per_km:        Option<i64>,
+    pub ride_categories:     Option<String>,
+    pub photo_urls:          Option<String>,
+    pub description:         Option<String>,
+    pub location_country:    Option<String>,
+    pub location_city:       Option<String>,
+    pub lud16:               Option<String>,
+    pub nostr_event_id:      Option<String>,
+    pub service_interval_km: i64,
+    pub km_driven_total:     i64,
+    pub created_at:          i64,
+    pub updated_at:          i64,
 }
 
 /// POST /listings/driver
@@ -82,23 +85,24 @@ pub async fn upsert(
         r#"INSERT INTO driver_listings
            (id, driver_pubkey, driver_npub, listing_name, vehicle, vehicle_type, seats, price_per_km,
             ride_categories, photo_urls, description, location_country, location_city, lud16,
-            nostr_event_id, created_at, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)
+            nostr_event_id, service_interval_km, created_at, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)
            ON CONFLICT(id) DO UPDATE SET
-             listing_name     = ?4,
-             vehicle          = ?5,
-             vehicle_type     = ?6,
-             seats            = ?7,
-             price_per_km     = ?8,
-             ride_categories  = ?9,
-             photo_urls       = ?10,
-             description      = ?11,
-             location_country = ?12,
-             location_city    = ?13,
-             lud16            = ?14,
-             nostr_event_id   = ?15,
-             updated_at       = ?16,
-             deleted_at       = NULL"#
+             listing_name        = ?4,
+             vehicle             = ?5,
+             vehicle_type        = ?6,
+             seats               = ?7,
+             price_per_km        = ?8,
+             ride_categories     = ?9,
+             photo_urls          = ?10,
+             description         = ?11,
+             location_country    = ?12,
+             location_city       = ?13,
+             lud16               = ?14,
+             nostr_event_id      = ?15,
+             service_interval_km = ?16,
+             updated_at          = ?17,
+             deleted_at          = NULL"#
     )
     .bind(&body.id)
     .bind(&auth.public_key)
@@ -115,13 +119,15 @@ pub async fn upsert(
     .bind(&body.location_city)
     .bind(&body.lud16)
     .bind(&body.nostr_event_id)
+    .bind(body.service_interval_km.unwrap_or(5000))
     .bind(now)
     .execute(&state.db).await?;
 
     let row: DriverListingRow = sqlx::query_as(
         "SELECT id, driver_pubkey, driver_npub, listing_name, vehicle, vehicle_type, seats,
                 price_per_km, ride_categories, photo_urls, description, location_country,
-                location_city, lud16, nostr_event_id, created_at, updated_at
+                location_city, lud16, nostr_event_id, service_interval_km, km_driven_total,
+                created_at, updated_at
          FROM driver_listings WHERE id = ?1"
     )
     .bind(&body.id)
@@ -139,7 +145,8 @@ pub async fn list_mine(
     let rows: Vec<DriverListingRow> = sqlx::query_as(
         "SELECT id, driver_pubkey, driver_npub, listing_name, vehicle, vehicle_type, seats,
                 price_per_km, ride_categories, photo_urls, description, location_country,
-                location_city, lud16, nostr_event_id, created_at, updated_at
+                location_city, lud16, nostr_event_id, service_interval_km, km_driven_total,
+                created_at, updated_at
          FROM driver_listings
          WHERE driver_pubkey = ?1 AND deleted_at IS NULL
          ORDER BY updated_at DESC"
@@ -169,6 +176,63 @@ pub async fn delete_one(
         return Err(AppError::BadRequest("listing not found or not owned by you".into()));
     }
     Ok(Json(serde_json::json!({ "ok": true, "id": id, "deleted_at": now })))
+}
+
+#[derive(Deserialize)]
+pub struct AddKmInput {
+    pub km_driven: f64,   // accepts decimals (e.g. 12.4) but stored as integer km
+}
+
+/// POST /listings/driver/:id/km
+/// Driver phone POSTs the kilometres driven on a completed ride for a specific
+/// listing. Backend increments the listing's lifetime odometer.
+/// Only the listing's owner can update it (NIP-98 auth required).
+pub async fn add_km(
+    auth: AuthUser,
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(body): Json<AddKmInput>,
+) -> AppResult<Json<serde_json::Value>> {
+    if body.km_driven < 0.0 || body.km_driven > 5000.0 {
+        return Err(AppError::BadRequest(
+            "km_driven must be between 0 and 5000 (sanity bound)".into()
+        ));
+    }
+    let km_int = body.km_driven.round() as i64;
+    let now = chrono::Utc::now().timestamp();
+
+    let result = sqlx::query(
+        "UPDATE driver_listings
+         SET km_driven_total = km_driven_total + ?1, updated_at = ?2
+         WHERE id = ?3 AND driver_pubkey = ?4 AND deleted_at IS NULL"
+    )
+    .bind(km_int).bind(now).bind(&id).bind(&auth.public_key)
+    .execute(&state.db).await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::BadRequest(
+            "listing not found, not owned by you, or already deleted".into()
+        ));
+    }
+
+    // Return the new total + service-due hint so the driver UI can update without a refetch.
+    let (km_total, service_int): (i64, i64) = sqlx::query_as(
+        "SELECT km_driven_total, service_interval_km FROM driver_listings WHERE id = ?1"
+    ).bind(&id).fetch_one(&state.db).await?;
+
+    let service_due_km = if service_int > 0 {
+        ((km_total / service_int) + 1) * service_int
+    } else { 0 };
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "id": id,
+        "km_added": km_int,
+        "km_driven_total": km_total,
+        "service_interval_km": service_int,
+        "service_due_km": service_due_km,
+        "km_until_service": (service_due_km - km_total).max(0),
+    })))
 }
 
 #[derive(Deserialize)]

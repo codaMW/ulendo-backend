@@ -463,6 +463,24 @@ pub async fn release_direct(
             )
             .bind(now2).bind(&body.ride_id)
             .execute(&state.db).await;
+
+            // Increment lifetime stats for the driver so the dashboard reflects real totals.
+            // We derive driver_pubkey from the ride row since release_direct is called by the booker.
+            let driver_pk: Option<String> = sqlx::query_scalar(
+                "SELECT matched_driver FROM ride_requests WHERE id=?1"
+            ).bind(&body.ride_id).fetch_optional(&state.db).await.ok().flatten();
+            if let Some(dpk) = driver_pk {
+                let _ = sqlx::query(
+                    "INSERT INTO driver_stats (pubkey, total_rides, total_earned_sats, updated_at)
+                     VALUES (?1, 1, ?2, ?3)
+                     ON CONFLICT(pubkey) DO UPDATE SET
+                       total_rides       = driver_stats.total_rides + 1,
+                       total_earned_sats = driver_stats.total_earned_sats + ?2,
+                       updated_at        = ?3"
+                ).bind(&dpk).bind(driver_sats).bind(now2)
+                .execute(&state.db).await;
+            }
+
             Ok(Json(serde_json::json!({
                 "status": "released",
                 "driver_sats": driver_sats,

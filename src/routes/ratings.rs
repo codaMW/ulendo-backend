@@ -132,6 +132,20 @@ pub struct DashboardData {
     pub total_earned_sats: i64,
     pub total_earned_mwk: i64,
     pub recent_rides: Vec<RecentRide>,
+    pub listings: Vec<ListingStats>,
+    pub recent_reviews: Vec<RatingDetail>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct ListingStats {
+    pub id:                  String,
+    pub listing_name:        Option<String>,
+    pub vehicle:             Option<String>,
+    pub vehicle_type:        Option<String>,
+    pub photo_urls:          Option<String>,
+    pub price_per_km:        Option<i64>,
+    pub service_interval_km: i64,
+    pub km_driven_total:     i64,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -160,6 +174,31 @@ pub async fn driver_dashboard(
          FROM ride_requests WHERE matched_driver=?1 ORDER BY created_at DESC LIMIT 10"
     ).bind(&auth.public_key).fetch_all(&state.db).await.unwrap_or_default();
 
-    Ok(Json(DashboardData { total_rides: rides, total_ratings: ratings, avg_rating: avg,
-        total_earned_sats: sats, total_earned_mwk: mwk, recent_rides: recent }))
+    // Active listings with per-listing km tracking + service interval.
+    // Frontend computes service-due as: ceil(km_driven_total / service_interval_km) * service_interval_km.
+    let listings = sqlx::query_as::<_, ListingStats>(
+        "SELECT id, listing_name, vehicle, vehicle_type, photo_urls, price_per_km,
+                service_interval_km, km_driven_total
+         FROM driver_listings
+         WHERE driver_pubkey = ?1 AND deleted_at IS NULL
+         ORDER BY updated_at DESC"
+    ).bind(&auth.public_key).fetch_all(&state.db).await.unwrap_or_default();
+
+    // Recent reviews — same shape as /ratings/reviews/:pubkey, embedded for one round-trip.
+    let recent_reviews = sqlx::query_as::<_, RatingDetail>(
+        "SELECT id, score, comment, rider_pubkey, created_at
+         FROM ratings WHERE driver_pubkey = ?1
+         ORDER BY created_at DESC LIMIT 20"
+    ).bind(&auth.public_key).fetch_all(&state.db).await.unwrap_or_default();
+
+    Ok(Json(DashboardData {
+        total_rides: rides,
+        total_ratings: ratings,
+        avg_rating: avg,
+        total_earned_sats: sats,
+        total_earned_mwk: mwk,
+        recent_rides: recent,
+        listings,
+        recent_reviews,
+    }))
 }
