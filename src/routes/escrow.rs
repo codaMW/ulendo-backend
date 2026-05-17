@@ -435,13 +435,20 @@ pub async fn release_direct(
     }
 
     // Insert pending row BEFORE calling Blink so driver can poll immediately
-    sqlx::query(
+    tracing::info!("[escrow] release_direct begin: ride={} amount={} driver_sats={} lud16={}",
+        &body.ride_id, body.amount_sats, driver_sats, &body.lud16);
+    let pending_insert = sqlx::query(
         "INSERT INTO direct_releases (id, ride_id, payer_pubkey, lud16, amount_sats, driver_sats, fee_sats, status, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?8)"
     )
     .bind(&release_id).bind(&body.ride_id).bind(&auth.public_key).bind(&body.lud16)
     .bind(body.amount_sats).bind(driver_sats).bind(fee_sats).bind(now)
-    .execute(&state.db).await?;
+    .execute(&state.db).await;
+    if let Err(e) = &pending_insert {
+        tracing::error!("[escrow] pending INSERT failed: {}", e);
+        return Err(AppError::Internal(anyhow::anyhow!("pending INSERT failed: {}", e)));
+    }
+    tracing::info!("[escrow] release_direct pending row inserted: {}", &release_id);
 
     tracing::info!("[escrow] direct release: {} sats to {} (fee: {})", driver_sats, body.lud16, fee_sats);
 
@@ -470,7 +477,7 @@ pub async fn release_direct(
                 "SELECT matched_driver FROM ride_requests WHERE id=?1"
             ).bind(&body.ride_id).fetch_optional(&state.db).await.ok().flatten();
             if let Some(dpk) = driver_pk {
-                let _ = sqlx::query(
+                let stats_res = sqlx::query(
                     "INSERT INTO driver_stats (pubkey, total_rides, total_earned_sats, updated_at)
                      VALUES (?1, 1, ?2, ?3)
                      ON CONFLICT(pubkey) DO UPDATE SET
@@ -479,6 +486,11 @@ pub async fn release_direct(
                        updated_at        = ?3"
                 ).bind(&dpk).bind(driver_sats).bind(now2)
                 .execute(&state.db).await;
+                if let Err(e) = &stats_res {
+                    tracing::error!("[escrow] driver_stats UPSERT failed: {}", e);
+                } else {
+                    tracing::info!("[escrow] driver_stats updated for driver {}", &dpk[..8.min(dpk.len())]);
+                }
             }
 
             Ok(Json(serde_json::json!({
