@@ -395,40 +395,6 @@ pub async fn test_add_driver(
     Ok(Json(serde_json::json!({"ok": true, "pubkey": body.pubkey, "lat": body.lat, "lng": body.lng})))
 }
 
-/// GET /debug/online-drivers — lists ALL drivers currently sending heartbeats.
-/// No auth, no location filter. For diagnostics only.
-pub async fn debug_online_drivers(
-    State(state): State<AppState>,
-) -> AppResult<Json<serde_json::Value>> {
-    let now = chrono::Utc::now().timestamp();
-    let rows = sqlx::query_as::<_, (String, f64, f64, i64, String, String)>(
-        "SELECT pubkey, lat, lng, updated_at, vehicle_type, COALESCE(display_name, '')
-         FROM driver_locations
-         WHERE online = 1 AND updated_at > ?1
-         ORDER BY updated_at DESC LIMIT 50"
-    )
-    .bind(now - 300)
-    .fetch_all(&state.db).await
-    .map_err(|e| AppError::Internal(anyhow::anyhow!("{e}")))?;
-
-    let entries: Vec<serde_json::Value> = rows.iter().map(|(pk, lat, lng, ts, vt, name)| {
-        serde_json::json!({
-            "pubkey": pk,
-            "pubkey_short": &pk[..16.min(pk.len())],
-            "lat": lat,
-            "lng": lng,
-            "vehicle_type": vt,
-            "name": name,
-            "last_heartbeat_sec_ago": now - ts,
-        })
-    }).collect();
-
-    Ok(Json(serde_json::json!({
-        "count": entries.len(),
-        "drivers": entries,
-        "now": now,
-    })))
-}
 
 // ─── HTTP Heartbeat (REST fallback for mobile) ────────────────────────────
 pub async fn http_heartbeat(
@@ -437,7 +403,6 @@ pub async fn http_heartbeat(
     Json(hb): Json<GpsHeartbeat>,
 ) -> AppResult<Json<serde_json::Value>> {
     upsert_driver_location(&state, &auth.public_key, &hb).await;
-    tracing::info!("[gps] HTTP heartbeat: {} at {},{}", &auth.public_key[..8], hb.lat, hb.lng);
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
@@ -521,7 +486,6 @@ pub async fn poll_bookings(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<serde_json::Value>>> {
     let cutoff = chrono::Utc::now().timestamp() - 300;
-    tracing::info!("[poll] driver {} polling since {}", &auth.public_key[..8], cutoff);
     let rows = sqlx::query_as::<_, (String, String, i64, i64, String, String)>(
         "SELECT id, rider_pubkey, fare_sats, created_at, pickup_text, dest_text
          FROM ride_requests
@@ -535,7 +499,6 @@ pub async fn poll_bookings(
     .fetch_all(&state.db).await
     .map_err(|e| { tracing::error!("[poll] DB query failed: {}", e); e })
     .unwrap_or_default();
-    tracing::info!("[poll] driver {} found {} bookings", &auth.public_key[..8], rows.len());
     let bookings: Vec<serde_json::Value> = rows.iter().map(|(id, rider, fare, ts, pickup, dest)| {
         serde_json::json!({"rideId": id, "riderPubkey": rider, "fareSats": fare, "createdAt": ts, "pickup": pickup, "destination": dest})
     }).collect();

@@ -204,7 +204,6 @@ async fn main() -> Result<()> {
         .route("/listings/driver/:id",            delete(routes::driver_listings::delete_one))
         .route("/listings/driver/:id/km",         post(routes::driver_listings::add_km))
         .route("/rides/nearby-listings",          get(routes::driver_listings::nearby_listings))
-        .route("/debug/online-drivers",           axum::routing::get(routes::rides::debug_online_drivers))
         .route("/escrow/direct-release-status/:ride_id", axum::routing::get(routes::escrow::direct_release_status))
         // Rides — driver discovery
         .route("/rides/request",          post(routes::rides::request_ride))

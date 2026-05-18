@@ -88,13 +88,11 @@ async fn handle_socket(socket: WebSocket, pubkey: String, state: crate::AppState
                 }
                 // Handle GPS heartbeat — update driver location
                 if text.contains("ulendo-gps-heartbeat") {
-                    tracing::info!("[ws] GPS heartbeat from {}", &pk[..8]);
                     match serde_json::from_str::<serde_json::Value>(&text) {
                         Ok(hb) => {
                             if let Some(payload) = hb.get("payload") {
                                 match serde_json::from_value::<crate::routes::rides::GpsHeartbeat>(payload.clone()) {
                                     Ok(gps) => {
-                                        tracing::info!("[ws] GPS parsed: lat={}, lng={}", gps.lat, gps.lng);
                                         let s = state_clone.clone();
                                         let p = pk.clone();
                                         tokio::spawn(async move {
