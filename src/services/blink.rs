@@ -181,28 +181,51 @@ impl BlinkClient {
         Ok(r.send.status)
     }
 
-    async fn send_ln_address(&self, lud16: &str, amount: i64, memo: &str) -> Result<String> {
+    async fn send_ln_address(&self, lud16: &str, amount: i64, _memo: &str) -> Result<String> {
+        // Blink's LnAddressPaymentSendInput accepts only walletId, lnAddress, amount.
+        // It does NOT accept `memo` — passing it produces a 500 from galoy.
+        // We also parse the application-level errors[] array so we surface
+        // real reasons (e.g. "amount too low", "destination unreachable").
         #[derive(Deserialize)]
         struct SendResp {
             #[serde(rename = "lnAddressPaymentSend")]
             send: StatusResult,
         }
         #[derive(Deserialize)]
-        struct StatusResult { status: String }
-
+        struct StatusResult {
+            status: String,
+            #[serde(default)]
+            errors: Vec<GqlErr>,
+        }
+        #[derive(Deserialize)]
+        struct GqlErr {
+            #[serde(default)] message: String,
+            #[serde(default)] code: Option<String>,
+        }
         let r: SendResp = self.gql(
             r#"mutation S($input: LnAddressPaymentSendInput!) {
-                lnAddressPaymentSend(input: $input) { status }
+                lnAddressPaymentSend(input: $input) {
+                    status
+                    errors { code message path }
+                }
             }"#,
             serde_json::json!({
                 "input": {
                     "walletId":  self.wallet_id,
                     "lnAddress": lud16,
                     "amount":    amount,
-                    "memo":      memo,
                 }
             }),
         ).await?;
+        if !r.send.errors.is_empty() {
+            let e = &r.send.errors[0];
+            let code_part = e.code.as_deref().unwrap_or("");
+            let prefix = if code_part.is_empty() { String::new() } else { format!("[{}] ", code_part) };
+            return Err(anyhow::anyhow!("{}{}", prefix, e.message));
+        }
+        if r.send.status == "FAILURE" {
+            return Err(anyhow::anyhow!("payment FAILURE (no error message returned)"));
+        }
         Ok(r.send.status)
     }
 }
