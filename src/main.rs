@@ -233,12 +233,6 @@ async fn main() -> Result<()> {
         .route("/ws", get(routes::ws::ws_handler))
         .route("/online", get(routes::ws::online_drivers))
         .route("/upload/photo", post(routes::upload::upload_photo))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any)
-        )
         // Relay cache
         .route("/relay/listings",         get(routes::relay::search_listings))
         .route("/verify/invoice",       post(routes::upload::create_verify_invoice))
