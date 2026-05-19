@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use crate::{AppError, AppResult, AppState};
 
 pub async fn upload_photo(
+    _auth: crate::auth::AuthUser,
     State(_state): State<AppState>,
     mut multipart: Multipart,
 ) -> AppResult<Json<Value>> {

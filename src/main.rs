@@ -231,7 +231,6 @@ async fn main() -> Result<()> {
         .route("/push/subscribe",         post(routes::push::subscribe))
         .route("/push/unsubscribe",       delete(routes::push::unsubscribe))
         .route("/ws", get(routes::ws::ws_handler))
-        .route("/online", get(routes::ws::online_drivers))
         .route("/upload/photo", post(routes::upload::upload_photo))
         // Relay cache
         .route("/relay/listings",         get(routes::relay::search_listings))

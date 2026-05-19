@@ -221,10 +221,3 @@ async fn send_booking_push(state: &crate::AppState, to_pubkey: &str, pickup: &st
     tracing::info!("[push] booking push sent to {} ({} subs)", &to_pubkey[..8], subs.len());
 }
 
-pub async fn online_drivers(
-    State(state): State<crate::AppState>,
-) -> axum::Json<Vec<String>> {
-    let reg = state.ws.lock().await;
-    let keys: Vec<String> = reg.keys().cloned().collect();
-    axum::Json(keys)
-}
