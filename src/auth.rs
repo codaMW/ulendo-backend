@@ -85,6 +85,54 @@ impl Nip98Event {
     }
 }
 
+/// Verify a raw NIP-98 token (base64-encoded kind 27235 event).
+/// Returns (npub, hex_pubkey) on success.
+/// Reusable across HTTP (Authorization header) and WS (auth message body).
+pub fn verify_nip98_token(
+    token: &str,
+    method: &str,
+    url: &str,
+) -> Result<(String, String), AppError> {
+    let json_bytes = STANDARD.decode(token)
+        .map_err(|_| AppError::Unauthorized("invalid base64".into()))?;
+
+    let event: Nip98Event = serde_json::from_slice(&json_bytes)
+        .map_err(|_| AppError::Unauthorized("invalid event JSON".into()))?;
+
+    if event.kind != 27235 {
+        return Err(AppError::Unauthorized(format!("expected kind 27235, got {}", event.kind)));
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if (now - event.created_at).abs() > 60 {
+        return Err(AppError::Unauthorized("event timestamp expired".into()));
+    }
+
+    let event_url = event.get_tag("u")
+        .ok_or_else(|| AppError::Unauthorized("missing 'u' tag".into()))?;
+    if event_url != url {
+        return Err(AppError::Unauthorized(format!(
+            "url mismatch: expected '{url}', got '{event_url}'"
+        )));
+    }
+
+    let event_method = event.get_tag("method")
+        .ok_or_else(|| AppError::Unauthorized("missing 'method' tag".into()))?;
+    if !event_method.eq_ignore_ascii_case(method) {
+        return Err(AppError::Unauthorized("method mismatch".into()));
+    }
+
+    event.verify_signature()?;
+
+    let npub = pubkey_to_npub(&event.pubkey)
+        .map_err(|e| AppError::Unauthorized(format!("npub encode failed: {e}")))?;
+
+    Ok((npub, event.pubkey.clone()))
+}
+
 pub fn verify_nip98_header(
     headers: &HeaderMap,
     method: &str,

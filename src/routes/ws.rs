@@ -40,14 +40,80 @@ pub async fn ws_handler(
 }
 
 async fn handle_socket(socket: WebSocket, pubkey: String, state: crate::AppState) {
+    use futures::SinkExt;
     let registry = state.ws.clone();
     let (mut sender, mut receiver) = socket.split();
+
+    // ── SECURITY: NIP-98 auth gate ──────────────────────────────────────────
+    // Wait up to 5s for client to send {"type":"auth","token":"<base64-nip98>"}.
+    // Token MUST have:
+    //   kind 27235
+    //   u tag = "wss://ulendo-app-production.up.railway.app/ws"
+    //   method tag = "WS"
+    //   created_at within 60s
+    //   valid Schnorr sig
+    //   event.pubkey === query pubkey (prevents impersonation)
+    // On pass: register in state.ws and continue. On fail/timeout: close.
+    const WS_AUTH_URL: &str = "wss://ulendo-app-production.up.railway.app/ws";
+    let auth_result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        async {
+            while let Some(Ok(msg)) = receiver.next().await {
+                if let axum::extract::ws::Message::Text(text) = msg {
+                    let v: serde_json::Value = match serde_json::from_str(&text) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if v.get("type").and_then(|t| t.as_str()) != Some("auth") {
+                        continue;
+                    }
+                    let token = match v.get("token").and_then(|t| t.as_str()) {
+                        Some(t) => t,
+                        None => return Err("missing token".to_string()),
+                    };
+                    match crate::auth::verify_nip98_token(token, "WS", WS_AUTH_URL) {
+                        Ok((_npub, hex_pubkey)) => {
+                            if hex_pubkey != pubkey {
+                                return Err(format!("auth pubkey mismatch (token claimed {}, query said {})", &hex_pubkey[..8.min(hex_pubkey.len())], &pubkey[..8.min(pubkey.len())]));
+                            }
+                            return Ok(());
+                        }
+                        Err(e) => return Err(format!("verify failed: {:?}", e)),
+                    }
+                }
+            }
+            Err("connection closed before auth".to_string())
+        }
+    ).await;
+
+    match auth_result {
+        Ok(Ok(())) => {
+            // proceed below
+        }
+        Ok(Err(reason)) => {
+            tracing::warn!("[ws] auth FAILED for {}: {}", &pubkey[..8.min(pubkey.len())], reason);
+            let payload = serde_json::json!({"type":"auth_failed","reason":reason});
+            let _ = sender.send(axum::extract::ws::Message::Text(payload.to_string())).await;
+            let _ = sender.close().await;
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("[ws] auth TIMEOUT for {} (5s exceeded)", &pubkey[..8.min(pubkey.len())]);
+            let payload = serde_json::json!({"type":"auth_failed","reason":"auth timeout"});
+            let _ = sender.send(axum::extract::ws::Message::Text(payload.to_string())).await;
+            let _ = sender.close().await;
+            return;
+        }
+    }
+
+    // ── Auth passed. NOW register the connection. ──
     let (tx, mut rx) = broadcast::channel::<String>(64);
     {
         let mut reg = registry.lock().await;
         reg.insert(pubkey.clone(), tx);
     }
-    tracing::info!("[ws] {} connected", &pubkey[..8.min(pubkey.len())]);
+    let _ = sender.send(axum::extract::ws::Message::Text(r#"{"type":"auth_ok"}"#.to_string())).await;
+    tracing::info!("[ws] {} authenticated and connected", &pubkey[..8.min(pubkey.len())]);
 
     // Server-side keepalive: ping client every 30s to prevent Railway proxy timeout
     let ping_tx = {
