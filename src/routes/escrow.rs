@@ -131,11 +131,33 @@ pub async fn release(
 
     let released_sats = booking.amount_sats - booking.fee_sats;
 
-    // Send to merchant
-    state.blink
+
+    // SECURITY: Atomically claim the release via state transition BEFORE calling Blink.
+    // Prevents concurrent release calls from double-spending the merchant payment.
+    let claim_now = chrono::Utc::now().timestamp();
+    let claim = sqlx::query(
+        "UPDATE bookings SET status='releasing', updated_at=?1 WHERE id=?2 AND status IN ('funded','held')"
+    )
+    .bind(claim_now).bind(&booking_id)
+    .execute(&state.db).await?;
+    if claim.rows_affected() == 0 {
+        return Err(AppError::BadRequest(
+            "booking is no longer releasable (another release may be in progress)".into()
+        ));
+    }
+
+    // Send to merchant (with rollback if Blink fails)
+    let blink_result = state.blink
         .send_to_address(&lud16, released_sats, "Ulendo escrow release")
-        .await
-        .map_err(|e| AppError::Payment(format!("payment failed: {e}")))?;
+        .await;
+    if let Err(e) = blink_result {
+        let _ = sqlx::query(
+            "UPDATE bookings SET status=?1, updated_at=?2 WHERE id=?3 AND status='releasing'"
+        )
+        .bind(&booking.status).bind(chrono::Utc::now().timestamp()).bind(&booking_id)
+        .execute(&state.db).await;
+        return Err(AppError::Payment(format!("payment failed: {e}")));
+    }
 
     let now = chrono::Utc::now().timestamp();
     sqlx::query(
