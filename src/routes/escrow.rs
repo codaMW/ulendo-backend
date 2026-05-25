@@ -381,10 +381,31 @@ pub async fn refund(
 // Booker can still release immediately or raise dispute within 60 seconds.
 
 pub async fn complete(
+    auth: AuthUser,
     Path(booking_id): Path<String>,
     State(state): State<crate::AppState>,
 ) -> AppResult<Json<EscrowActionResponse>> {
     let booking = fetch_booking(&state, &booking_id).await?;
+
+    // SECURITY: only the merchant (listing owner) can mark complete.
+    // Was: NO auth at all — anyone could trigger the 60s auto-release countdown
+    // on any booking ID, causing money to flow to the merchant without booker consent.
+    let merchant_npub: Option<String> = sqlx::query_scalar(
+        "SELECT owner_npub FROM listings WHERE id=?1"
+    )
+    .bind(&booking.listing_id)
+    .fetch_optional(&state.db)
+    .await?
+    .flatten();
+    let merchant_npub = merchant_npub
+        .ok_or_else(|| AppError::BadRequest("listing has no owner".into()))?;
+    if auth.npub != merchant_npub {
+        tracing::warn!("[escrow] complete REJECTED: caller={} is not merchant={} for booking={}",
+            &auth.npub[..16.min(auth.npub.len())],
+            &merchant_npub[..16.min(merchant_npub.len())],
+            &booking_id);
+        return Err(AppError::Unauthorized("only the merchant can mark a booking complete".into()));
+    }
 
     if !["funded", "held", "in_progress"].contains(&booking.status.as_str()) {
         return Err(AppError::BadRequest(
@@ -392,13 +413,19 @@ pub async fn complete(
         ));
     }
 
+    // SECURITY: Atomic state transition (defense-in-depth).
     let now = chrono::Utc::now().timestamp();
-    sqlx::query(
-        "UPDATE bookings SET status='completed', completed_at=?1, updated_at=?2 WHERE id=?3"
+    let claim = sqlx::query(
+        "UPDATE bookings SET status='completed', completed_at=?1, updated_at=?2 WHERE id=?3 AND status IN ('funded','held','in_progress')"
     )
     .bind(now).bind(now).bind(&booking_id)
     .execute(&state.db)
     .await?;
+    if claim.rows_affected() == 0 {
+        return Err(AppError::BadRequest(
+            "booking is no longer in a completable state".into()
+        ));
+    }
 
     tracing::info!(booking_id = %booking_id, "ride completed — 60s auto-release countdown started");
 
