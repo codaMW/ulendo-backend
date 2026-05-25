@@ -23,38 +23,80 @@ pub async fn submit_rating(
     State(state): State<AppState>,
     Json(body): Json<SubmitRatingInput>,
 ) -> AppResult<Json<RatingResponse>> {
+    // ─── SECURITY HARDENED ────────────────────────────────────────────────────
+    // Previous version trusted body.driver_pubkey AND body.ride_id without verification.
+    // Anyone could rate anyone for any (real or fake) ride, tanking competitors.
+    // New version: ride_id → DB lookup; driver_pubkey from ride record; caller must be rider.
+
     if body.score < 1 || body.score > 5 {
         return Err(AppError::BadRequest("Score must be 1-5".into()));
     }
+
+    let ride: Option<(String, Option<String>, String)> = sqlx::query_as::<_, (String, Option<String>, String)>(
+        "SELECT rider_pubkey, matched_driver, status FROM ride_requests WHERE id=?1"
+    ).bind(&body.ride_id).fetch_optional(&state.db).await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("{e}")))?;
+
+    let (ride_rider, ride_driver_opt, ride_status) = ride.ok_or_else(||
+        AppError::BadRequest("ride not found".into())
+    )?;
+
+    if auth.public_key != ride_rider {
+        tracing::warn!("[ratings] submit REJECTED: caller={} is not rider={} for ride={}",
+            &auth.public_key[..8.min(auth.public_key.len())],
+            &ride_rider[..8.min(ride_rider.len())],
+            &body.ride_id);
+        return Err(AppError::Unauthorized("you can only rate rides you took".into()));
+    }
+
+    if ride_status != "completed" {
+        return Err(AppError::BadRequest(format!(
+            "cannot rate ride with status '{}'  — only completed rides can be rated", ride_status
+        )));
+    }
+
+    let real_driver_pubkey = ride_driver_opt.ok_or_else(||
+        AppError::BadRequest("ride has no matched driver".into())
+    )?;
+
+    if auth.public_key == real_driver_pubkey {
+        return Err(AppError::BadRequest("cannot rate yourself".into()));
+    }
+
     let already: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM ratings WHERE ride_id=?1 AND rider_pubkey=?2)"
     ).bind(&body.ride_id).bind(&auth.public_key)
     .fetch_one(&state.db).await.unwrap_or(false);
-    if already { return Err(AppError::BadRequest("Already rated".into())); }
+    if already { return Err(AppError::BadRequest("already rated".into())); }
+
+    let comment = body.comment.as_deref().unwrap_or("");
+    let comment = if comment.len() > 500 { &comment[..500] } else { comment };
 
     let id = uuid::Uuid::new_v4().to_string().replace('-', "");
     let now = chrono::Utc::now().timestamp();
     let cat = body.category.as_deref().unwrap_or("city");
 
     sqlx::query("INSERT INTO ratings (id,ride_id,driver_pubkey,rider_pubkey,score,comment,category,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")
-        .bind(&id).bind(&body.ride_id).bind(&body.driver_pubkey).bind(&auth.public_key)
-        .bind(body.score).bind(body.comment.as_deref().unwrap_or("")).bind(cat).bind(now)
+        .bind(&id).bind(&body.ride_id).bind(&real_driver_pubkey).bind(&auth.public_key)
+        .bind(body.score).bind(comment).bind(cat).bind(now)
         .execute(&state.db).await.map_err(|e| AppError::Internal(anyhow::anyhow!("{e}")))?;
 
     sqlx::query(
-        "INSERT INTO driver_stats (pubkey,total_rides,total_ratings,sum_scores,avg_rating,category,updated_at) VALUES (?1,1,1,?2,?3,?4,?5)
-         ON CONFLICT(pubkey) DO UPDATE SET total_ratings=driver_stats.total_ratings+1, sum_scores=driver_stats.sum_scores+?2,
-         avg_rating=CAST((driver_stats.sum_scores+?2) AS REAL)/(driver_stats.total_ratings+1), updated_at=?5"
-    ).bind(&body.driver_pubkey).bind(body.score).bind(body.score as f64).bind(cat).bind(now)
+        "INSERT INTO driver_stats (pubkey,total_rides,total_ratings,sum_scores,avg_rating,category,updated_at) VALUES (?1,1,1,?2,?3,?4,?5) ON CONFLICT(pubkey) DO UPDATE SET total_ratings=driver_stats.total_ratings+1, sum_scores=driver_stats.sum_scores+?2, avg_rating=CAST((driver_stats.sum_scores+?2) AS REAL)/(driver_stats.total_ratings+1), updated_at=?5"
+    ).bind(&real_driver_pubkey).bind(body.score).bind(body.score as f64).bind(cat).bind(now)
     .execute(&state.db).await.map_err(|e| AppError::Internal(anyhow::anyhow!("{e}")))?;
 
     let (new_avg, total): (f64, i64) = sqlx::query_as(
         "SELECT avg_rating, total_ratings FROM driver_stats WHERE pubkey=?1"
-    ).bind(&body.driver_pubkey).fetch_one(&state.db).await.unwrap_or((0.0, 0));
+    ).bind(&real_driver_pubkey).fetch_one(&state.db).await.unwrap_or((0.0, 0));
+
+    tracing::info!("[ratings] rider {} rated driver {} {} stars for ride {}",
+        &auth.public_key[..8.min(auth.public_key.len())],
+        &real_driver_pubkey[..8.min(real_driver_pubkey.len())],
+        body.score, &body.ride_id);
 
     Ok(Json(RatingResponse { id, new_avg, total_ratings: total }))
 }
-
 #[derive(Serialize)]
 pub struct DriverRating {
     pub pubkey: String,
