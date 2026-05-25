@@ -535,8 +535,10 @@ pub async fn release_direct(
         return Err(AppError::Unauthorized("only the booker can release this ride".into()));
     }
 
-    // 3. State must be releasable
-    if status != "accepted" && status != "in_progress" && status != "matched" {
+    // 3. State must be releasable. NOTE: 'pending' is the status for bookings-derived
+    // rides (rides.rs:460 INSERT). The bookings table tracks actual state; ride_requests stays 'pending'.
+    // Safe because auth (rider-only) + lud16 (from DB) + amount (from DB) + idempotency still apply.
+    if status != "accepted" && status != "in_progress" && status != "matched" && status != "pending" {
         return Err(AppError::BadRequest(format!(
             "ride not in releasable state (current status: {})", status
         )));
