@@ -304,16 +304,39 @@ pub async fn refund(
     let lud16 = booking.lud16_refund.as_ref()
         .ok_or_else(|| AppError::BadRequest("no refund address on file".into()))?;
 
-    state.blink
-        .send_to_address(lud16, booking.amount_sats, "Ulendo escrow refund")
-        .await
-        .map_err(|e| AppError::Payment(format!("refund failed: {e}")))?;
-
+    // SECURITY: Atomically claim the refund via state transition BEFORE calling Blink.
+    // Prevents two concurrent refund calls from both reaching the Blink send.
     let now = chrono::Utc::now().timestamp();
+    let claim = sqlx::query(
+        "UPDATE bookings SET status='refunding', updated_at=?1 WHERE id=?2 AND status IN ('funded','held')"
+    )
+    .bind(now).bind(&booking_id)
+    .execute(&state.db).await?;
+    if claim.rows_affected() == 0 {
+        return Err(AppError::BadRequest(
+            "booking is no longer in a refundable state (another refund may be in progress)".into()
+        ));
+    }
+
+    // Now call Blink. If it fails, roll status back so retry is possible.
+    let blink_result = state.blink
+        .send_to_address(lud16, booking.amount_sats, "Ulendo escrow refund")
+        .await;
+
+    if let Err(e) = blink_result {
+        let _ = sqlx::query(
+            "UPDATE bookings SET status=?1, updated_at=?2 WHERE id=?3 AND status='refunding'"
+        )
+        .bind(&booking.status).bind(chrono::Utc::now().timestamp()).bind(&booking_id)
+        .execute(&state.db).await;
+        return Err(AppError::Payment(format!("refund failed: {e}")));
+    }
+
+    let now2 = chrono::Utc::now().timestamp();
     sqlx::query(
         "UPDATE bookings SET status='refunded', refunded_at=?1, updated_at=?2 WHERE id=?3"
     )
-    .bind(now).bind(now).bind(&booking_id)
+    .bind(now2).bind(now2).bind(&booking_id)
     .execute(&state.db)
     .await?;
 
