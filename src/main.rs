@@ -219,10 +219,16 @@ async fn main() -> Result<()> {
         .route("/ratings/driver/:pubkey", get(routes::ratings::get_driver_rating))
         .route("/ratings/reviews/:pubkey", get(routes::ratings::get_driver_ratings))
         .route("/ratings/leaderboard",    get(routes::ratings::leaderboard))
-        .route("/fiat/escrow",post(routes::fiat::create_fiat_escrow))
-        .route("/fiat/verify-sms",post(routes::fiat::verify_sms))
-        .route("/fiat/release",post(routes::fiat::release_fiat))
-        .route("/fiat/payouts",get(routes::fiat::pending_payouts))
+        // ── FIAT ROUTES DISABLED ──────────────────────────────────────────────
+        // Fiat money flow has been removed pending PayChangu API integration.
+        // Previous routes had several critical security issues (driver could
+        // self-release escrow, pending_payouts had no auth and leaked phone
+        // numbers, errors silently swallowed). When PayChangu integration is
+        // ready, these will be replaced with a properly designed payment flow.
+        // .route("/fiat/escrow",post(routes::fiat::create_fiat_escrow))
+        // .route("/fiat/verify-sms",post(routes::fiat::verify_sms))
+        // .route("/fiat/release",post(routes::fiat::release_fiat))
+        // .route("/fiat/payouts",get(routes::fiat::pending_payouts))
         .route("/ratings/dashboard",      get(routes::ratings::driver_dashboard))
         .route("/escrow/:id/refund",      post(routes::escrow::refund))
         .route("/escrow/:id/complete",    post(routes::escrow::complete))
