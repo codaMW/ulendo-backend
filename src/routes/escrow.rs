@@ -220,6 +220,7 @@ pub async fn dispute(
     State(state): State<AppState>,
     Json(body): Json<DisputeRequest>,
 ) -> AppResult<Json<EscrowActionResponse>> {
+    let _ = body; // reason field accepted but not yet persisted (TODO: add dispute_reason column)
     let booking = fetch_booking(&state, &booking_id).await?;
 
     if booking.booker_npub != auth.npub {
@@ -231,10 +232,21 @@ pub async fn dispute(
         ));
     }
 
+    // SECURITY: Atomic state transition BEFORE any Blink calls.
+    // Prevents two concurrent dispute calls from both reaching the payment paths.
     let now = chrono::Utc::now().timestamp();
+    let claim = sqlx::query(
+        "UPDATE bookings SET status='disputing', updated_at=?1 WHERE id=?2 AND status IN ('funded','held','in_progress')"
+    )
+    .bind(now).bind(&booking_id)
+    .execute(&state.db).await?;
+    if claim.rows_affected() == 0 {
+        return Err(AppError::BadRequest(
+            "booking is no longer in a disputable state".into()
+        ));
+    }
 
-    // Dispute split: 30% to driver, 70% refunded to booker
-    // For non-ride bookings: full refund
+    // Compute split.
     let (merchant_sats, booker_refund_sats) = if booking.booking_type == "ride" {
         let driver_share = (booking.amount_sats * 30) / 100;
         let booker_share = booking.amount_sats - driver_share;
@@ -243,17 +255,8 @@ pub async fn dispute(
         (0i64, booking.amount_sats)
     };
 
-    // Refund to booker if they have a refund address
-    if booker_refund_sats > 0 {
-        if let Some(lud16) = &booking.lud16_refund {
-            let _ = state.blink
-                .send_to_address(lud16, booker_refund_sats, "Ulendo dispute refund")
-                .await
-                .map_err(|e| tracing::warn!("refund failed: {e}"));
-        }
-    }
-
-    // Pay merchant their portion (base fare for rides)
+    // STEP 1: Pay merchant first (smaller share = lower stakes if anything goes wrong).
+    // If this fails, roll back to original status so user can retry.
     if merchant_sats > 0 {
         let merchant_lud16: Option<String> = sqlx::query_scalar(
             "SELECT lud16 FROM listings WHERE id=?1"
@@ -262,27 +265,53 @@ pub async fn dispute(
         .fetch_optional(&state.db)
         .await?
         .flatten();
-
         if let Some(lud16) = merchant_lud16 {
-            let _ = state.blink
-                .send_to_address(&lud16, merchant_sats, "Ulendo dispute base fare")
-                .await
-                .map_err(|e| tracing::warn!("merchant dispute payment failed: {e}"));
+            if let Err(e) = state.blink.send_to_address(&lud16, merchant_sats, "Ulendo dispute base fare").await {
+                // Roll back state so booker can retry.
+                let _ = sqlx::query(
+                    "UPDATE bookings SET status=?1, updated_at=?2 WHERE id=?3 AND status='disputing'"
+                ).bind(&booking.status).bind(chrono::Utc::now().timestamp()).bind(&booking_id)
+                .execute(&state.db).await;
+                tracing::error!("[escrow] dispute merchant payment failed for {}: {}", &booking_id, e);
+                return Err(AppError::Payment(format!("dispute merchant payment failed: {e}")));
+            }
+            tracing::info!("[escrow] dispute merchant paid {} sats to {} for booking {}", merchant_sats, &lud16, &booking_id);
+        } else {
+            tracing::warn!("[escrow] dispute: merchant has no lud16 for booking {} — booker gets full refund", &booking_id);
         }
     }
 
+    // STEP 2: Refund booker. If THIS fails after merchant succeeded, we leave the booking in
+    // 'disputed_partial' so admin can manually reconcile. The state is no longer rollable.
+    let mut booker_paid = true;
+    if booker_refund_sats > 0 {
+        if let Some(lud16) = &booking.lud16_refund {
+            if let Err(e) = state.blink.send_to_address(lud16, booker_refund_sats, "Ulendo dispute refund").await {
+                tracing::error!("[escrow] dispute BOOKER REFUND FAILED for {}: {} — manual reconciliation needed", &booking_id, e);
+                booker_paid = false;
+            } else {
+                tracing::info!("[escrow] dispute booker refunded {} sats to {} for booking {}", booker_refund_sats, lud16, &booking_id);
+            }
+        } else {
+            tracing::error!("[escrow] dispute: booker has no lud16_refund for booking {} — funds stuck", &booking_id);
+            booker_paid = false;
+        }
+    }
+
+    let now2 = chrono::Utc::now().timestamp();
+    let final_status = if booker_paid { "disputed" } else { "disputed_partial" };
     sqlx::query(
-        "UPDATE bookings SET status='disputed', disputed_at=?1, updated_at=?2 WHERE id=?3"
+        "UPDATE bookings SET status=?1, disputed_at=?2, updated_at=?3 WHERE id=?4"
     )
-    .bind(now).bind(now).bind(&booking_id)
+    .bind(final_status).bind(now2).bind(now2).bind(&booking_id)
     .execute(&state.db)
     .await?;
 
-    tracing::info!(
-        booking_id = %booking_id,
-        reason = %body.reason.as_deref().unwrap_or("none"),
-        "dispute raised"
-    );
+    if !booker_paid {
+        return Err(AppError::Payment(
+            "dispute partially resolved (merchant paid, booker refund failed) — admin will reconcile".into()
+        ));
+    }
 
     Ok(Json(EscrowActionResponse {
         booking_id,
