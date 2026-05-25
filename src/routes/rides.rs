@@ -224,6 +224,34 @@ pub async fn accept_ride(
 ) -> AppResult<Json<AcceptRideResponse>> {
     let now = chrono::Utc::now().timestamp();
 
+    // SECURITY: Driver eligibility — must have a profile with valid lud16
+    let driver_lud16: Option<String> = sqlx::query_scalar(
+        "SELECT lud16 FROM driver_locations WHERE pubkey=?1"
+    ).bind(&auth.public_key).fetch_optional(&state.db).await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?;
+    let driver_lud16 = driver_lud16.unwrap_or_default();
+    if driver_lud16.is_empty() || !driver_lud16.contains('@') {
+        return Err(AppError::BadRequest(
+            "driver has no valid lightning address — set one in profile before accepting rides".into()
+        ));
+    }
+
+    // SECURITY: Self-booking guard — fetch rider_pubkey first to make sure caller != rider
+    let rider_pubkey: Option<String> = sqlx::query_scalar(
+        "SELECT rider_pubkey FROM ride_requests WHERE id=?1"
+    ).bind(&body.ride_id).fetch_optional(&state.db).await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?;
+    let rider_pubkey = rider_pubkey.ok_or_else(||
+        AppError::BadRequest("ride not found".into())
+    )?;
+    if auth.public_key == rider_pubkey {
+        tracing::warn!("[rides] accept REJECTED: caller={} tried to accept own ride={}",
+            &auth.public_key[..8.min(auth.public_key.len())], &body.ride_id);
+        return Err(AppError::BadRequest(
+            "cannot accept your own ride request".into()
+        ));
+    }
+
     // Atomic: only the first driver to accept gets the ride
     let rows = sqlx::query(
         "UPDATE ride_requests SET status='accepted', matched_driver=?1, updated_at=?2
@@ -517,9 +545,49 @@ pub async fn accept_booking_http(
     State(state): State<AppState>,
     Json(body): Json<AcceptBookingInput>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let _ = sqlx::query("UPDATE ride_requests SET status='accepted', matched_driver=?1 WHERE id=?2")
-        .bind(&auth.public_key).bind(&body.ride_id).execute(&state.db).await;
-    tracing::info!("[booking] driver {} accepted ride {}", &auth.public_key[..8], &body.ride_id);
+    // SECURITY: this used to be a permissive UPDATE with no state check, no driver eligibility,
+    // no self-booking guard, and silently swallowed errors. Now it enforces all the same checks as accept_ride.
+    let now = chrono::Utc::now().timestamp();
+
+    let driver_lud16: Option<String> = sqlx::query_scalar(
+        "SELECT lud16 FROM driver_locations WHERE pubkey=?1"
+    ).bind(&auth.public_key).fetch_optional(&state.db).await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?;
+    let driver_lud16 = driver_lud16.unwrap_or_default();
+    if driver_lud16.is_empty() || !driver_lud16.contains('@') {
+        return Err(AppError::BadRequest(
+            "driver has no valid lightning address — set one in profile before accepting rides".into()
+        ));
+    }
+
+    let rider_pubkey: Option<String> = sqlx::query_scalar(
+        "SELECT rider_pubkey FROM ride_requests WHERE id=?1"
+    ).bind(&body.ride_id).fetch_optional(&state.db).await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?;
+    let rider_pubkey = rider_pubkey.ok_or_else(||
+        AppError::BadRequest("ride not found".into())
+    )?;
+    if auth.public_key == rider_pubkey {
+        tracing::warn!("[booking] accept REJECTED: caller={} tried to accept own ride={}",
+            &auth.public_key[..8.min(auth.public_key.len())], &body.ride_id);
+        return Err(AppError::BadRequest(
+            "cannot accept your own ride request".into()
+        ));
+    }
+
+    let rows = sqlx::query(
+        "UPDATE ride_requests SET status='accepted', matched_driver=?1, updated_at=?2 WHERE id=?3 AND status='searching'"
+    )
+    .bind(&auth.public_key).bind(now).bind(&body.ride_id)
+    .execute(&state.db).await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?;
+
+    if rows.rows_affected() == 0 {
+        return Err(AppError::BadRequest("Ride already taken or expired".into()));
+    }
+
+    tracing::info!("[booking] driver {} accepted ride {} (eta_min={:?}, fare_sats={:?})",
+        &auth.public_key[..8.min(auth.public_key.len())], &body.ride_id, body.eta_min, body.fare_sats);
     Ok(Json(serde_json::json!({"ok": true, "ride_id": body.ride_id})))
 }
 
