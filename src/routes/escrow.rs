@@ -405,55 +405,102 @@ pub async fn release_direct(
     State(state): State<crate::AppState>,
     Json(body): Json<DirectReleaseRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let fee_sats = (body.amount_sats as u64 * state.cfg.escrow_fee_bps / 10_000) as i64;
-    let driver_sats = body.amount_sats - fee_sats;
-    let now = chrono::Utc::now().timestamp();
-    let release_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+    // ─── SECURITY HARDENED RELEASE_DIRECT ─────────────────────────────────────
+    // Previous version trusted request-body fields. New version derives everything
+    // from the database and enforces these invariants:
+    //   1. Caller is the actual booker of the ride.
+    //   2. Ride exists, has a matched driver, and is in a releasable status.
+    //   3. Amount comes from ride.fare_sats, NOT the request.
+    //   4. lud16 comes from driver's profile, NOT the request.
+    //   5. Idempotency via partial UNIQUE INDEX on (ride_id) WHERE status IN ('pending','released').
 
-    // Validate up front. If we fail, write a `failed` row so driver poll can show real error.
+    // 1. Look up the ride
+    let ride: (String, Option<String>, i64, String) = match sqlx::query_as::<_, (String, Option<String>, i64, String)>(
+        "SELECT rider_pubkey, matched_driver, fare_sats, status FROM ride_requests WHERE id = ?1"
+    )
+    .bind(&body.ride_id)
+    .fetch_optional(&state.db).await? {
+        Some(r) => r,
+        None => return Err(AppError::BadRequest("ride not found".into())),
+    };
+    let (rider_pubkey, matched_driver_opt, fare_sats, status) = ride;
+
+    // 2. AUTH scope: caller must be the booker
+    if auth.public_key != rider_pubkey {
+        tracing::warn!("[escrow] release_direct REJECTED: caller={} is not booker={} for ride={}",
+            &auth.public_key[..8.min(auth.public_key.len())],
+            &rider_pubkey[..8.min(rider_pubkey.len())],
+            &body.ride_id);
+        return Err(AppError::Unauthorized("only the booker can release this ride".into()));
+    }
+
+    // 3. State must be releasable
+    if status != "accepted" && status != "in_progress" && status != "matched" {
+        return Err(AppError::BadRequest(format!(
+            "ride not in releasable state (current status: {})", status
+        )));
+    }
+
+    // 4. Driver must be matched
+    let driver_pubkey = matched_driver_opt.ok_or_else(||
+        AppError::BadRequest("ride has no matched driver".into())
+    )?;
+
+    // 5. lud16 from driver's profile (NOT request body)
+    let driver_lud16: String = match sqlx::query_scalar::<_, String>(
+        "SELECT lud16 FROM driver_locations WHERE pubkey = ?1"
+    )
+    .bind(&driver_pubkey)
+    .fetch_optional(&state.db).await? {
+        Some(s) if !s.is_empty() && s.contains('@') => s,
+        _ => return Err(AppError::BadRequest("driver has no valid lightning address on file".into())),
+    };
+
+    // 6. Amount from DB (NOT request body)
+    let amount_sats = fare_sats;
+    if amount_sats <= 0 {
+        return Err(AppError::BadRequest("ride fare is zero or invalid".into()));
+    }
+    let fee_sats = (amount_sats as u64 * state.cfg.escrow_fee_bps / 10_000) as i64;
+    let driver_sats = amount_sats - fee_sats;
     if driver_sats < 100 {
-        let msg = format!("amount too low for Lightning (min 100 sats after fee, requested {} sats)", driver_sats);
-        let _ = sqlx::query(
-            "INSERT INTO direct_releases (id, ride_id, payer_pubkey, lud16, amount_sats, driver_sats, fee_sats, status, error_message, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'failed', ?8, ?9, ?9)"
-        )
-        .bind(&release_id).bind(&body.ride_id).bind(&auth.public_key).bind(&body.lud16)
-        .bind(body.amount_sats).bind(driver_sats).bind(fee_sats).bind(&msg).bind(now)
-        .execute(&state.db).await;
-        return Err(AppError::BadRequest(msg));
-    }
-    if !body.lud16.contains('@') {
-        let msg = "invalid lud16 address".to_string();
-        let _ = sqlx::query(
-            "INSERT INTO direct_releases (id, ride_id, payer_pubkey, lud16, amount_sats, driver_sats, fee_sats, status, error_message, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'failed', ?8, ?9, ?9)"
-        )
-        .bind(&release_id).bind(&body.ride_id).bind(&auth.public_key).bind(&body.lud16)
-        .bind(body.amount_sats).bind(driver_sats).bind(fee_sats).bind(&msg).bind(now)
-        .execute(&state.db).await;
-        return Err(AppError::BadRequest(msg));
+        return Err(AppError::BadRequest(format!(
+            "amount too low for Lightning (min 100 sats after fee, would pay {} sats)", driver_sats
+        )));
     }
 
-    // Insert pending row BEFORE calling Blink so driver can poll immediately
-    tracing::info!("[escrow] release_direct begin: ride={} amount={} driver_sats={} lud16={}",
-        &body.ride_id, body.amount_sats, driver_sats, &body.lud16);
-    let pending_insert = sqlx::query(
+    // 7. IDEMPOTENCY: try to insert pending row. The partial UNIQUE INDEX on
+    // (ride_id) WHERE status IN ('pending','released') makes this atomic.
+    // If insertion fails with a constraint violation, another release is already in flight.
+    let release_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let now = chrono::Utc::now().timestamp();
+    let insert_res = sqlx::query(
         "INSERT INTO direct_releases (id, ride_id, payer_pubkey, lud16, amount_sats, driver_sats, fee_sats, status, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?8)"
     )
-    .bind(&release_id).bind(&body.ride_id).bind(&auth.public_key).bind(&body.lud16)
-    .bind(body.amount_sats).bind(driver_sats).bind(fee_sats).bind(now)
+    .bind(&release_id).bind(&body.ride_id).bind(&auth.public_key).bind(&driver_lud16)
+    .bind(amount_sats).bind(driver_sats).bind(fee_sats).bind(now)
     .execute(&state.db).await;
-    if let Err(e) = &pending_insert {
-        tracing::error!("[escrow] pending INSERT failed: {}", e);
-        return Err(AppError::Internal(anyhow::anyhow!("pending INSERT failed: {}", e)));
+
+    if let Err(e) = &insert_res {
+        let msg = e.to_string();
+        if msg.contains("UNIQUE") || msg.contains("constraint") {
+            return Err(AppError::BadRequest("a release for this ride is already pending or completed".into()));
+        }
+        tracing::error!("[escrow] release_direct insert failed: {}", e);
+        return Err(AppError::Internal(anyhow::anyhow!("pending insert failed: {}", e)));
     }
-    tracing::info!("[escrow] release_direct pending row inserted: {}", &release_id);
 
-    tracing::info!("[escrow] direct release: {} sats to {} (fee: {})", driver_sats, body.lud16, fee_sats);
+    tracing::info!("[escrow] release_direct authorized: ride={} booker={} driver={} amount={} fee={} → {}",
+        &body.ride_id,
+        &auth.public_key[..8.min(auth.public_key.len())],
+        &driver_pubkey[..8.min(driver_pubkey.len())],
+        amount_sats, fee_sats, &driver_lud16);
 
-    // Call Blink
-    let blink_result = state.blink.send_to_address(&body.lud16, driver_sats, &format!("Ulendo ride {}", body.ride_id)).await;
+    // 8. Call Blink
+    let blink_result = state.blink.send_to_address(
+        &driver_lud16, driver_sats, &format!("Ulendo ride {}", body.ride_id)
+    ).await;
     let now2 = chrono::Utc::now().timestamp();
 
     match blink_result {
@@ -463,49 +510,33 @@ pub async fn release_direct(
             )
             .bind(&blink_status).bind(now2).bind(&release_id)
             .execute(&state.db).await?;
-            // Mark the ride as completed so the driver becomes discoverable to new bookers again.
-            // (nearby_drivers excludes drivers with status IN ('accepted','in_progress','funded'))
             let _ = sqlx::query(
                 "UPDATE ride_requests SET status='completed', updated_at=?1 WHERE id=?2"
             )
             .bind(now2).bind(&body.ride_id)
             .execute(&state.db).await;
-
-            // Increment lifetime stats for the driver so the dashboard reflects real totals.
-            // We derive driver_pubkey from the ride row since release_direct is called by the booker.
-            let driver_pk: Option<String> = sqlx::query_scalar(
-                "SELECT matched_driver FROM ride_requests WHERE id=?1"
-            ).bind(&body.ride_id).fetch_optional(&state.db).await.ok().flatten();
-            if let Some(dpk) = driver_pk {
-                let stats_res = sqlx::query(
-                    "INSERT INTO driver_stats (pubkey, total_rides, total_earned_sats, updated_at)
-                     VALUES (?1, 1, ?2, ?3)
-                     ON CONFLICT(pubkey) DO UPDATE SET
-                       total_rides       = driver_stats.total_rides + 1,
-                       total_earned_sats = driver_stats.total_earned_sats + ?2,
-                       updated_at        = ?3"
-                ).bind(&dpk).bind(driver_sats).bind(now2)
-                .execute(&state.db).await;
-                if let Err(e) = &stats_res {
-                    tracing::error!("[escrow] driver_stats UPSERT failed: {}", e);
-                } else {
-                    tracing::info!("[escrow] driver_stats updated for driver {}", &dpk[..8.min(dpk.len())]);
-                }
+            let stats_res = sqlx::query(
+                "INSERT INTO driver_stats (pubkey, total_rides, total_earned_sats, updated_at)
+                 VALUES (?1, 1, ?2, ?3)
+                 ON CONFLICT(pubkey) DO UPDATE SET
+                   total_rides       = driver_stats.total_rides + 1,
+                   total_earned_sats = driver_stats.total_earned_sats + ?2,
+                   updated_at        = ?3"
+            ).bind(&driver_pubkey).bind(driver_sats).bind(now2)
+            .execute(&state.db).await;
+            if let Err(e) = &stats_res {
+                tracing::error!("[escrow] driver_stats UPSERT failed: {}", e);
             }
-
             Ok(Json(serde_json::json!({
                 "status": "released",
                 "driver_sats": driver_sats,
                 "fee_sats": fee_sats,
-                "lud16": body.lud16,
+                "lud16": driver_lud16,
                 "release_id": release_id,
                 "blink_status": blink_status,
             })))
         }
         Err(e) => {
-            // Surface Blink's actual error to the booker so they know it's
-            // a payment-network issue (e.g. destination unreachable, insufficient
-            // balance, rate limited) rather than just "internal server error".
             let err_msg = format!("Lightning payment failed: {e}");
             tracing::error!("[escrow] Blink failure for ride={}: {}", &body.ride_id, &err_msg);
             sqlx::query(
@@ -513,8 +544,6 @@ pub async fn release_direct(
             )
             .bind(&err_msg).bind(now2).bind(&release_id)
             .execute(&state.db).await?;
-            // Return BadRequest (not Internal) so the booker sees the actual reason
-            // rather than "internal server error". This is a payment failure, not a server bug.
             Err(AppError::BadRequest(err_msg))
         }
     }
