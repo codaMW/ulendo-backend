@@ -269,16 +269,49 @@ pub async fn accept_ride(
     }
 
     // Fetch ride details
-    let ride: (String, f64, f64, Option<f64>, Option<f64>, i64, String) = sqlx::query_as(
-        "SELECT rider_pubkey, pickup_lat, pickup_lng, dest_lat, dest_lng, fare_sats, drivers_notified
+    // Fetch ride details + estimated_km (for server-side fare recomputation)
+    let ride: (String, f64, f64, Option<f64>, Option<f64>, i64, String, Option<f64>) = sqlx::query_as(
+        "SELECT rider_pubkey, pickup_lat, pickup_lng, dest_lat, dest_lng, fare_sats, drivers_notified, estimated_km
          FROM ride_requests WHERE id=?1"
     )
     .bind(&body.ride_id)
     .fetch_one(&state.db)
     .await
     .map_err(|_| AppError::NotFound("ride not found".into()))?;
+    let (rider_pk, plat, plng, dlat, dlng, requested_fare, notified_json, estimated_km_opt) = ride;
 
-    let (rider_pk, plat, plng, dlat, dlng, fare, notified_json) = ride;
+    // SECURITY: Recompute fare from THIS DRIVER's current price_per_km × estimated_km.
+    // Previously trusted body.fare_sats (calculated by the rider client from a possibly
+    // stale cached driver price). Now: driver_listings price is authoritative.
+    let driver_ppk: Option<i64> = sqlx::query_scalar(
+        "SELECT price_per_km FROM driver_listings WHERE driver_pubkey=?1 AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 1"
+    ).bind(&auth.public_key).fetch_optional(&state.db).await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?;
+    let mut driver_ppk = driver_ppk.unwrap_or(0);
+    if driver_ppk <= 0 {
+        driver_ppk = sqlx::query_scalar::<_, i64>(
+            "SELECT price_per_km FROM driver_locations WHERE pubkey=?1"
+        ).bind(&auth.public_key).fetch_optional(&state.db).await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?
+        .unwrap_or(0);
+    }
+    let estimated_km = estimated_km_opt.unwrap_or(0.0);
+    let recomputed_fare: i64 = if driver_ppk > 0 && estimated_km > 0.0 {
+        (driver_ppk as f64 * estimated_km).round() as i64
+    } else {
+        requested_fare
+    };
+    if recomputed_fare != requested_fare {
+        tracing::info!("[rides] fare recomputed for accept: ride={} driver={} requested={} -> actual={} (ppk={} km={})",
+            &body.ride_id,
+            &auth.public_key[..8.min(auth.public_key.len())],
+            requested_fare, recomputed_fare, driver_ppk, estimated_km);
+        let _ = sqlx::query(
+            "UPDATE ride_requests SET fare_sats=?1, updated_at=?2 WHERE id=?3"
+        ).bind(recomputed_fare).bind(now).bind(&body.ride_id)
+        .execute(&state.db).await;
+    }
+    let fare = recomputed_fare;
 
     // Notify rider: "Driver found!"
     let accept_msg = serde_json::json!({
@@ -586,9 +619,64 @@ pub async fn accept_booking_http(
         return Err(AppError::BadRequest("Ride already taken or expired".into()));
     }
 
-    tracing::info!("[booking] driver {} accepted ride {} (eta_min={:?}, fare_sats={:?})",
-        &auth.public_key[..8.min(auth.public_key.len())], &body.ride_id, body.eta_min, body.fare_sats);
-    Ok(Json(serde_json::json!({"ok": true, "ride_id": body.ride_id})))
+    // SECURITY: Recompute fare from current driver price (matches accept_ride logic).
+    let ride_meta: Option<(String, Option<f64>)> = sqlx::query_as::<_, (String, Option<f64>)>(
+        "SELECT rider_pubkey, estimated_km FROM ride_requests WHERE id=?1"
+    ).bind(&body.ride_id).fetch_optional(&state.db).await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?;
+    let (rider_pk, estimated_km_opt) = ride_meta.unwrap_or((String::new(), None));
+
+    let mut driver_ppk: i64 = sqlx::query_scalar(
+        "SELECT price_per_km FROM driver_listings WHERE driver_pubkey=?1 AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 1"
+    ).bind(&auth.public_key).fetch_optional(&state.db).await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?
+    .unwrap_or(0);
+    if driver_ppk <= 0 {
+        driver_ppk = sqlx::query_scalar::<_, i64>(
+            "SELECT price_per_km FROM driver_locations WHERE pubkey=?1"
+        ).bind(&auth.public_key).fetch_optional(&state.db).await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {e}")))?
+        .unwrap_or(0);
+    }
+    let estimated_km = estimated_km_opt.unwrap_or(0.0);
+    let requested_fare = body.fare_sats.unwrap_or(0);
+    let recomputed_fare: i64 = if driver_ppk > 0 && estimated_km > 0.0 {
+        (driver_ppk as f64 * estimated_km).round() as i64
+    } else {
+        requested_fare
+    };
+    if recomputed_fare != requested_fare && recomputed_fare > 0 {
+        tracing::info!("[booking] fare recomputed: ride={} driver={} requested={} -> actual={} (ppk={} km={})",
+            &body.ride_id, &auth.public_key[..8.min(auth.public_key.len())],
+            requested_fare, recomputed_fare, driver_ppk, estimated_km);
+        let _ = sqlx::query(
+            "UPDATE ride_requests SET fare_sats=?1, updated_at=?2 WHERE id=?3"
+        ).bind(recomputed_fare).bind(now).bind(&body.ride_id)
+        .execute(&state.db).await;
+    }
+    let final_fare = if recomputed_fare > 0 { recomputed_fare } else { requested_fare };
+
+    // Notify rider with the ACTUAL fare so they see correct price before paying
+    if !rider_pk.is_empty() {
+        let accept_msg = serde_json::json!({
+            "to": rider_pk,
+            "from": "server",
+            "type": "ulendo-ride-accepted",
+            "payload": {
+                "rideId": body.ride_id.clone(),
+                "driverPubkey": auth.public_key.clone(),
+                "fareSats": final_fare,
+            },
+        });
+        let reg = state.ws.lock().await;
+        if let Some(tx) = reg.get(&rider_pk) {
+            let _ = tx.send(accept_msg.to_string());
+        }
+    }
+
+    tracing::info!("[booking] driver {} accepted ride {} (eta_min={:?}, fare_sats={})",
+        &auth.public_key[..8.min(auth.public_key.len())], &body.ride_id, body.eta_min, final_fare);
+    Ok(Json(serde_json::json!({"ok": true, "ride_id": body.ride_id, "fare_sats": final_fare})))
 }
 
 pub async fn poll_ride_status(
