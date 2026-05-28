@@ -56,7 +56,7 @@ async fn handle_socket(socket: WebSocket, pubkey: String, state: crate::AppState
     // On pass: register in state.ws and continue. On fail/timeout: close.
     const WS_AUTH_URL: &str = "wss://ulendo-app-production.up.railway.app/ws";
     let auth_result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
+        tokio::time::Duration::from_secs(10),
         async {
             while let Some(Ok(msg)) = receiver.next().await {
                 if let axum::extract::ws::Message::Text(text) = msg {
