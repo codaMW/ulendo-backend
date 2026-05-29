@@ -20,6 +20,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::AppError;
+use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+
+// NIP-98 replay protection: maps event.id -> expiry timestamp (unix seconds).
+// Events are valid for ±60s, so dedup cache holds entries for ~70s (with margin).
+// Self-cleaning: each verify_nip98_token call prunes expired entries on access.
+fn seen_tokens() -> &'static Mutex<HashMap<String, i64>> {
+    static SEEN: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 
 #[derive(Clone, Debug)]
 pub struct AuthUser {
@@ -130,6 +141,17 @@ pub fn verify_nip98_token(
     let npub = pubkey_to_npub(&event.pubkey)
         .map_err(|e| AppError::Unauthorized(format!("npub encode failed: {e}")))?;
 
+    // Replay protection: reject tokens we've already accepted within the validity window.
+    // Without this, a captured token can be replayed for up to 60s by any attacker.
+    {
+        let mut seen = seen_tokens().lock().map_err(|_| AppError::Internal(anyhow::anyhow!("seen_tokens lock poisoned")))?;
+        seen.retain(|_, expires| *expires > now);
+        if seen.contains_key(&event.id) {
+            tracing::warn!("[auth] NIP-98 replay rejected: token id={}", &event.id[..16.min(event.id.len())]);
+            return Err(AppError::Unauthorized("token already used (replay)".into()));
+        }
+        seen.insert(event.id.clone(), now + 70);
+    }
     Ok((npub, event.pubkey.clone()))
 }
 
