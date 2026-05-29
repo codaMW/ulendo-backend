@@ -98,7 +98,7 @@ async fn handle_socket(socket: WebSocket, pubkey: String, state: crate::AppState
             return;
         }
         Err(_) => {
-            tracing::warn!("[ws] auth TIMEOUT for {} (5s exceeded)", &pubkey[..8.min(pubkey.len())]);
+            tracing::warn!("[ws] auth TIMEOUT for {} (10s exceeded)", &pubkey[..8.min(pubkey.len())]);
             let payload = serde_json::json!({"type":"auth_failed","reason":"auth timeout"});
             let _ = sender.send(axum::extract::ws::Message::Text(payload.to_string())).await;
             let _ = sender.close().await;
