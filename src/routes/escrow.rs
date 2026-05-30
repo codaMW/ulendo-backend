@@ -506,6 +506,10 @@ pub async fn release_direct(
     State(state): State<crate::AppState>,
     Json(body): Json<DirectReleaseRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    tracing::info!("[escrow] release_direct ATTEMPT: ride={} caller={} req_lud16={} req_amount={}",
+        &body.ride_id,
+        &auth.public_key[..8.min(auth.public_key.len())],
+        &body.lud16, body.amount_sats);
     // ─── SECURITY HARDENED RELEASE_DIRECT ─────────────────────────────────────
     // Previous version trusted request-body fields. New version derives everything
     // from the database and enforces these invariants:
@@ -522,7 +526,10 @@ pub async fn release_direct(
     .bind(&body.ride_id)
     .fetch_optional(&state.db).await? {
         Some(r) => r,
-        None => return Err(AppError::BadRequest("ride not found".into())),
+        None => {
+            tracing::warn!("[escrow] release_direct pre-check FAILED: ride={} reason=ride_not_found", &body.ride_id);
+            return Err(AppError::BadRequest("ride not found".into()));
+        }
     };
     let (rider_pubkey, matched_driver_opt, fare_sats, status) = ride;
 
@@ -539,15 +546,20 @@ pub async fn release_direct(
     // rides (rides.rs:460 INSERT). The bookings table tracks actual state; ride_requests stays 'pending'.
     // Safe because auth (rider-only) + lud16 (from DB) + amount (from DB) + idempotency still apply.
     if status != "accepted" && status != "in_progress" && status != "matched" && status != "pending" {
+        tracing::warn!("[escrow] release_direct pre-check FAILED: ride={} reason=bad_status current={}", &body.ride_id, status);
         return Err(AppError::BadRequest(format!(
             "ride not in releasable state (current status: {})", status
         )));
     }
 
     // 4. Driver must be matched
-    let driver_pubkey = matched_driver_opt.ok_or_else(||
-        AppError::BadRequest("ride has no matched driver".into())
-    )?;
+    let driver_pubkey = match matched_driver_opt {
+        Some(d) => d,
+        None => {
+            tracing::warn!("[escrow] release_direct pre-check FAILED: ride={} reason=no_matched_driver", &body.ride_id);
+            return Err(AppError::BadRequest("ride has no matched driver".into()));
+        }
+    };
 
     // 5. lud16 from driver's profile (NOT request body)
     let driver_lud16: String = match sqlx::query_scalar::<_, String>(
@@ -556,17 +568,24 @@ pub async fn release_direct(
     .bind(&driver_pubkey)
     .fetch_optional(&state.db).await? {
         Some(s) if !s.is_empty() && s.contains('@') => s,
-        _ => return Err(AppError::BadRequest("driver has no valid lightning address on file".into())),
+        other => {
+            tracing::warn!("[escrow] release_direct pre-check FAILED: ride={} driver={} reason=invalid_lud16 db_value={:?}",
+                &body.ride_id, &driver_pubkey[..8.min(driver_pubkey.len())], other);
+            return Err(AppError::BadRequest("driver has no valid lightning address on file".into()));
+        }
     };
 
     // 6. Amount from DB (NOT request body)
     let amount_sats = fare_sats;
     if amount_sats <= 0 {
+        tracing::warn!("[escrow] release_direct pre-check FAILED: ride={} reason=zero_amount fare_sats={}", &body.ride_id, fare_sats);
         return Err(AppError::BadRequest("ride fare is zero or invalid".into()));
     }
     let fee_sats = (amount_sats as u64 * state.cfg.escrow_fee_bps / 10_000) as i64;
     let driver_sats = amount_sats - fee_sats;
     if driver_sats < 100 {
+        tracing::warn!("[escrow] release_direct pre-check FAILED: ride={} reason=below_min driver_sats={} fee_sats={} amount_sats={}",
+            &body.ride_id, driver_sats, fee_sats, amount_sats);
         return Err(AppError::BadRequest(format!(
             "amount too low for Lightning (min 100 sats after fee, would pay {} sats)", driver_sats
         )));
@@ -588,6 +607,7 @@ pub async fn release_direct(
     if let Err(e) = &insert_res {
         let msg = e.to_string();
         if msg.contains("UNIQUE") || msg.contains("constraint") {
+            tracing::warn!("[escrow] release_direct pre-check FAILED: ride={} reason=duplicate_release", &body.ride_id);
             return Err(AppError::BadRequest("a release for this ride is already pending or completed".into()));
         }
         tracing::error!("[escrow] release_direct insert failed: {}", e);
