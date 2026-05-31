@@ -500,6 +500,34 @@ pub async fn complete(
     }))
 }
 
+// Helper: persist a failed-release row so the driver's polling sees the failure
+// (and the human-readable reason) instead of waiting forever on "no_release_yet".
+//
+// Inserts a fresh failed row each time — different from the partial UNIQUE INDEX on
+// (ride_id) WHERE status IN ('pending','released'), so retries from the rider create
+// new visible failure records. driver's poll uses ORDER BY created_at DESC LIMIT 1.
+async fn record_failed_release(
+    db: &sqlx::SqlitePool,
+    ride_id: &str,
+    payer_pubkey: &str,
+    lud16: &str,
+    amount_sats: i64,
+    error_message: &str,
+) {
+    let release_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let now = chrono::Utc::now().timestamp();
+    let res = sqlx::query(
+        "INSERT INTO direct_releases (id, ride_id, payer_pubkey, lud16, amount_sats, driver_sats, fee_sats, status, error_message, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 'failed', ?6, ?7, ?7)"
+    )
+    .bind(&release_id).bind(ride_id).bind(payer_pubkey)
+    .bind(lud16).bind(amount_sats).bind(error_message).bind(now)
+    .execute(db).await;
+    if let Err(e) = res {
+        tracing::error!("[escrow] record_failed_release failed to insert for ride={}: {}", ride_id, e);
+    }
+}
+
 // Direct payout from Ulendo escrow wallet — no booking required
 pub async fn release_direct(
     auth: crate::auth::AuthUser,
@@ -528,6 +556,7 @@ pub async fn release_direct(
         Some(r) => r,
         None => {
             tracing::warn!("[escrow] release_direct pre-check FAILED: ride={} reason=ride_not_found", &body.ride_id);
+            record_failed_release(&state.db, &body.ride_id, &auth.public_key, &body.lud16, body.amount_sats, "Ride not found").await;
             return Err(AppError::BadRequest("ride not found".into()));
         }
     };
@@ -539,6 +568,9 @@ pub async fn release_direct(
             &auth.public_key[..8.min(auth.public_key.len())],
             &rider_pubkey[..8.min(rider_pubkey.len())],
             &body.ride_id);
+        // Note: we record under auth.public_key (the impostor), NOT rider_pubkey — so the
+        // legit driver doesn't see a poisoned 'failed' row caused by someone else.
+        record_failed_release(&state.db, &body.ride_id, &auth.public_key, &body.lud16, body.amount_sats, "Caller is not the booker").await;
         return Err(AppError::Unauthorized("only the booker can release this ride".into()));
     }
 
@@ -547,6 +579,8 @@ pub async fn release_direct(
     // Safe because auth (rider-only) + lud16 (from DB) + amount (from DB) + idempotency still apply.
     if status != "accepted" && status != "in_progress" && status != "matched" && status != "pending" {
         tracing::warn!("[escrow] release_direct pre-check FAILED: ride={} reason=bad_status current={}", &body.ride_id, status);
+        let msg = format!("Ride is not in a releasable state (current: {})", status);
+        record_failed_release(&state.db, &body.ride_id, &auth.public_key, &body.lud16, body.amount_sats, &msg).await;
         return Err(AppError::BadRequest(format!(
             "ride not in releasable state (current status: {})", status
         )));
@@ -557,6 +591,7 @@ pub async fn release_direct(
         Some(d) => d,
         None => {
             tracing::warn!("[escrow] release_direct pre-check FAILED: ride={} reason=no_matched_driver", &body.ride_id);
+            record_failed_release(&state.db, &body.ride_id, &auth.public_key, &body.lud16, body.amount_sats, "No matched driver for this ride").await;
             return Err(AppError::BadRequest("ride has no matched driver".into()));
         }
     };
@@ -571,6 +606,7 @@ pub async fn release_direct(
         other => {
             tracing::warn!("[escrow] release_direct pre-check FAILED: ride={} driver={} reason=invalid_lud16 db_value={:?}",
                 &body.ride_id, &driver_pubkey[..8.min(driver_pubkey.len())], other);
+            record_failed_release(&state.db, &body.ride_id, &auth.public_key, "", body.amount_sats, "Driver has no valid Lightning address on file. Ask them to set it up before retrying.").await;
             return Err(AppError::BadRequest("driver has no valid lightning address on file".into()));
         }
     };
@@ -579,6 +615,7 @@ pub async fn release_direct(
     let amount_sats = fare_sats;
     if amount_sats <= 0 {
         tracing::warn!("[escrow] release_direct pre-check FAILED: ride={} reason=zero_amount fare_sats={}", &body.ride_id, fare_sats);
+        record_failed_release(&state.db, &body.ride_id, &auth.public_key, &driver_lud16, amount_sats, "Ride fare is zero or invalid").await;
         return Err(AppError::BadRequest("ride fare is zero or invalid".into()));
     }
     let fee_sats = (amount_sats as u64 * state.cfg.escrow_fee_bps / 10_000) as i64;
@@ -586,6 +623,8 @@ pub async fn release_direct(
     if driver_sats < 100 {
         tracing::warn!("[escrow] release_direct pre-check FAILED: ride={} reason=below_min driver_sats={} fee_sats={} amount_sats={}",
             &body.ride_id, driver_sats, fee_sats, amount_sats);
+        let msg = format!("Fare too small for Lightning payout (would pay {} sats; minimum is 100). Booking should not have been allowed; please contact support — your escrow is intact.", driver_sats);
+        record_failed_release(&state.db, &body.ride_id, &auth.public_key, &driver_lud16, amount_sats, &msg).await;
         return Err(AppError::BadRequest(format!(
             "amount too low for Lightning (min 100 sats after fee, would pay {} sats)", driver_sats
         )));
@@ -608,6 +647,7 @@ pub async fn release_direct(
         let msg = e.to_string();
         if msg.contains("UNIQUE") || msg.contains("constraint") {
             tracing::warn!("[escrow] release_direct pre-check FAILED: ride={} reason=duplicate_release", &body.ride_id);
+            // No record_failed_release here — the existing pending/released row is already visible to driver poll.
             return Err(AppError::BadRequest("a release for this ride is already pending or completed".into()));
         }
         tracing::error!("[escrow] release_direct insert failed: {}", e);

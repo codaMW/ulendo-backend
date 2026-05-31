@@ -85,6 +85,15 @@ pub async fn request_ride(
     State(state): State<AppState>,
     Json(body): Json<RideRequestInput>,
 ) -> AppResult<Json<RideRequestResponse>> {
+    // PHASE 2 FIX: enforce minimum fare so we don't accept bookings that would later
+    // fail at Lightning payout (driver_sats < 100 after fee).
+    let min_fare = state.cfg.min_fare_sats;
+    if body.fare_sats < min_fare {
+        return Err(AppError::BadRequest(format!(
+            "Minimum fare is {} sats (you offered {}). Increase your trip estimate or choose a more economical option.",
+            min_fare, body.fare_sats
+        )));
+    }
     let ride_id = uuid::Uuid::new_v4().to_string().replace('-', "");
     let now = chrono::Utc::now().timestamp();
     let category = body.ride_category.as_deref().unwrap_or("city");
@@ -655,6 +664,26 @@ pub async fn accept_booking_http(
         .execute(&state.db).await;
     }
     let final_fare = if recomputed_fare > 0 { recomputed_fare } else { requested_fare };
+
+    // PHASE 2 FIX: re-validate the final fare after recompute. Even if the rider's
+    // request_ride passed min_fare check, the driver's current price × km may have
+    // produced a below-threshold fare (driver lowered price between request and accept).
+    // Reject the accept and roll back the status='accepted' UPDATE so the ride goes
+    // back to searching and the rider isn't stuck on an unfundable ride.
+    let min_fare = state.cfg.min_fare_sats;
+    if final_fare < min_fare {
+        tracing::warn!("[booking] accept REJECTED: ride={} driver={} final_fare={} < min_fare={}",
+            &body.ride_id, &auth.public_key[..8.min(auth.public_key.len())], final_fare, min_fare);
+        let _ = sqlx::query(
+            "UPDATE ride_requests SET status='searching', matched_driver=NULL, updated_at=?1 WHERE id=?2"
+        ).bind(now).bind(&body.ride_id)
+        .execute(&state.db).await;
+        return Err(AppError::BadRequest(format!(
+            "Computed fare {} sats is below the minimum of {} sats. Increase your price per km or estimated distance.",
+            final_fare, min_fare
+        )));
+    }
+
 
     // Notify rider with the ACTUAL fare so they see correct price before paying
     if !rider_pk.is_empty() {

@@ -46,6 +46,8 @@ pub struct Config {
     pub vapid_private_key: String,
     pub frontend_origin:   String,
     pub rate_limit_rpm:    u32,
+    pub min_fare_sats:     i64,
+    pub min_price_per_km_sats: i64,
     pub escrow_fee_bps:    u64,
 }
 
@@ -73,6 +75,10 @@ impl Config {
                                    .unwrap_or_else(|_| "60".into()).parse().unwrap_or(60),
             escrow_fee_bps:    std::env::var("ESCROW_FEE_BPS")
                                    .unwrap_or_else(|_| "150".into()).parse().unwrap_or(1000),
+            min_fare_sats:     std::env::var("MIN_FARE_SATS")
+                                   .unwrap_or_else(|_| "200".into()).parse().unwrap_or(200),
+            min_price_per_km_sats: std::env::var("MIN_PRICE_PER_KM_SATS")
+                                   .unwrap_or_else(|_| "50".into()).parse().unwrap_or(50),
         })
     }
 }

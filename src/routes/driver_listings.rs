@@ -57,6 +57,16 @@ pub async fn upsert(
     State(state): State<AppState>,
     Json(body): Json<UpsertDriverListing>,
 ) -> AppResult<Json<DriverListingRow>> {
+    // PHASE 2 FIX: enforce minimum price_per_km so drivers can't list rides that would
+    // produce sub-Lightning-minimum fares.
+    let min_ppk = state.cfg.min_price_per_km_sats;
+    if let Some(ppk) = body.price_per_km {
+        if ppk < min_ppk {
+            return Err(AppError::BadRequest(format!(
+                "Minimum price per km is {} sats (you set {}).", min_ppk, ppk
+            )));
+        }
+    }
     let now = chrono::Utc::now().timestamp();
 
     // Check if this listing already exists (so cap check only counts new creations)
