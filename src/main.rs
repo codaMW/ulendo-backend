@@ -217,6 +217,7 @@ async fn main() -> Result<()> {
         .route("/stays/listings/:id",             delete(routes::stays_listings::delete_one))
         .route("/stays/admin/listings",           get(routes::stays_listings::list_admin))
         .route("/stays/admin/listings/:id/verify", put(routes::stays_listings::admin_verify))
+        .route("/stays/search",                    get(routes::stays_listings::search))
         .route("/rides/nearby-listings",          get(routes::driver_listings::nearby_listings))
         .route("/escrow/direct-release-status/:ride_id", axum::routing::get(routes::escrow::direct_release_status))
         // Rides — driver discovery

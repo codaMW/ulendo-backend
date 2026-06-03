@@ -476,3 +476,58 @@ pub async fn admin_verify(
     tracing::info!("[stays] admin verified listing: id={}", &id);
     Ok(Json(serde_json::json!({"ok": true, "id": id, "verified": 1})))
 }
+
+// ─── GUEST BROWSE ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Debug)]
+pub struct SearchQuery {
+    pub city:   Option<String>,
+    pub limit:  Option<i64>,
+    pub offset: Option<i64>,
+}
+
+// GET /stays/search?city=Lilongwe&limit=20&offset=0
+// Public endpoint — no auth required. Returns verified, active, non-deleted listings.
+// Uses fuzzy_lat/fuzzy_lng for map display (exact coords hidden until booking).
+pub async fn search(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> AppResult<Json<Vec<StayListingRow>>> {
+    let limit  = q.limit.unwrap_or(20).clamp(1, 100);
+    let offset = q.offset.unwrap_or(0).max(0);
+
+    let rows = if let Some(city) = q.city.as_deref() {
+        sqlx::query_as::<_, StayListingRow>(
+            "SELECT id, host_pubkey, host_lud16, listing_type, property_class, title, description,
+                    house_rules, country, city, neighborhood, lat, lng, fuzzy_lat, fuzzy_lng,
+                    max_guests, bedrooms, beds, bathrooms, price_per_night_sats, cleaning_fee_sats,
+                    min_nights, max_nights, checkin_time, checkout_time, amenities, photo_urls,
+                    cancellation_policy, verified, active, created_at, updated_at
+             FROM stays_listings
+             WHERE verified=1 AND active=1 AND deleted_at IS NULL
+               AND lower(city) LIKE lower(?1)
+             ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
+        )
+        .bind(format!("%{}%", city))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.db).await
+    } else {
+        sqlx::query_as::<_, StayListingRow>(
+            "SELECT id, host_pubkey, host_lud16, listing_type, property_class, title, description,
+                    house_rules, country, city, neighborhood, lat, lng, fuzzy_lat, fuzzy_lng,
+                    max_guests, bedrooms, beds, bathrooms, price_per_night_sats, cleaning_fee_sats,
+                    min_nights, max_nights, checkin_time, checkout_time, amenities, photo_urls,
+                    cancellation_policy, verified, active, created_at, updated_at
+             FROM stays_listings
+             WHERE verified=1 AND active=1 AND deleted_at IS NULL
+             ORDER BY created_at DESC LIMIT ?1 OFFSET ?2"
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.db).await
+    }
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("DB search failed: {e}")))?;
+
+    Ok(Json(rows))
+}
