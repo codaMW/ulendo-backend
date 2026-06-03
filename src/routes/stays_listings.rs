@@ -481,53 +481,71 @@ pub async fn admin_verify(
 
 #[derive(Deserialize, Debug)]
 pub struct SearchQuery {
-    pub city:   Option<String>,
-    pub limit:  Option<i64>,
-    pub offset: Option<i64>,
+    pub city:      Option<String>,
+    pub lat:       Option<f64>,
+    pub lng:       Option<f64>,
+    pub radius_km: Option<f64>,
+    pub limit:     Option<i64>,
+    pub offset:    Option<i64>,
 }
 
-// GET /stays/search?city=Lilongwe&limit=20&offset=0
-// Public endpoint — no auth required. Returns verified, active, non-deleted listings.
-// Uses fuzzy_lat/fuzzy_lng for map display (exact coords hidden until booking).
+// GET /stays/search?lat=-15.78&lng=35.00&radius_km=50
+// GET /stays/search?city=Blantyre
+// Public — no auth. Returns verified active listings.
+// Priority: proximity (lat/lng) > city > all listings.
 pub async fn search(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
 ) -> AppResult<Json<Vec<StayListingRow>>> {
-    let limit  = q.limit.unwrap_or(20).clamp(1, 100);
-    let offset = q.offset.unwrap_or(0).max(0);
+    let limit     = q.limit.unwrap_or(20).clamp(1, 100);
+    let offset    = q.offset.unwrap_or(0).max(0);
+    let radius_km = q.radius_km.unwrap_or(50.0);
 
-    let rows = if let Some(city) = q.city.as_deref() {
-        sqlx::query_as::<_, StayListingRow>(
-            "SELECT id, host_pubkey, host_lud16, listing_type, property_class, title, description,
-                    house_rules, country, city, neighborhood, lat, lng, fuzzy_lat, fuzzy_lng,
-                    max_guests, bedrooms, beds, bathrooms, price_per_night_sats, cleaning_fee_sats,
-                    min_nights, max_nights, checkin_time, checkout_time, amenities, photo_urls,
-                    cancellation_policy, verified, active, created_at, updated_at
-             FROM stays_listings
+    let select = "SELECT id, host_pubkey, host_lud16, listing_type, property_class, title, description,
+                         house_rules, country, city, neighborhood, lat, lng, fuzzy_lat, fuzzy_lng,
+                         max_guests, bedrooms, beds, bathrooms, price_per_night_sats, cleaning_fee_sats,
+                         min_nights, max_nights, checkin_time, checkout_time, amenities, photo_urls,
+                         cancellation_policy, verified, active, created_at, updated_at";
+
+    let rows = if let (Some(guest_lat), Some(guest_lng)) = (q.lat, q.lng) {
+        let sql = format!(
+            "{} FROM stays_listings
+             WHERE verified=1 AND active=1 AND deleted_at IS NULL
+               AND (6371.0 * acos(
+                     cos(radians(?1)) * cos(radians(COALESCE(fuzzy_lat, lat))) *
+                     cos(radians(COALESCE(fuzzy_lng, lng)) - radians(?2)) +
+                     sin(radians(?1)) * sin(radians(COALESCE(fuzzy_lat, lat)))
+                   )) <= ?3
+             ORDER BY (6371.0 * acos(
+                     cos(radians(?1)) * cos(radians(COALESCE(fuzzy_lat, lat))) *
+                     cos(radians(COALESCE(fuzzy_lng, lng)) - radians(?2)) +
+                     sin(radians(?1)) * sin(radians(COALESCE(fuzzy_lat, lat)))
+                   )) ASC
+             LIMIT ?4 OFFSET ?5", select);
+        sqlx::query_as::<_, StayListingRow>(&sql)
+            .bind(guest_lat).bind(guest_lng).bind(radius_km).bind(limit).bind(offset)
+            .fetch_all(&state.db).await
+    } else if let Some(city) = q.city.as_deref() {
+        let sql = format!(
+            "{} FROM stays_listings
              WHERE verified=1 AND active=1 AND deleted_at IS NULL
                AND lower(city) LIKE lower(?1)
-             ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
-        )
-        .bind(format!("%{}%", city))
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&state.db).await
+             ORDER BY created_at DESC LIMIT ?2 OFFSET ?3", select);
+        sqlx::query_as::<_, StayListingRow>(&sql)
+            .bind(format!("%{}%", city)).bind(limit).bind(offset)
+            .fetch_all(&state.db).await
     } else {
-        sqlx::query_as::<_, StayListingRow>(
-            "SELECT id, host_pubkey, host_lud16, listing_type, property_class, title, description,
-                    house_rules, country, city, neighborhood, lat, lng, fuzzy_lat, fuzzy_lng,
-                    max_guests, bedrooms, beds, bathrooms, price_per_night_sats, cleaning_fee_sats,
-                    min_nights, max_nights, checkin_time, checkout_time, amenities, photo_urls,
-                    cancellation_policy, verified, active, created_at, updated_at
-             FROM stays_listings
+        let sql = format!(
+            "{} FROM stays_listings
              WHERE verified=1 AND active=1 AND deleted_at IS NULL
-             ORDER BY created_at DESC LIMIT ?1 OFFSET ?2"
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&state.db).await
+             ORDER BY created_at DESC LIMIT ?1 OFFSET ?2", select);
+        sqlx::query_as::<_, StayListingRow>(&sql)
+            .bind(limit).bind(offset)
+            .fetch_all(&state.db).await
     }
     .map_err(|e| AppError::Internal(anyhow::anyhow!("DB search failed: {e}")))?;
 
+    tracing::debug!("[stays] search returned {} listings", rows.len());
     Ok(Json(rows))
 }
+
