@@ -14,3 +14,4 @@ pub mod rides;
 pub mod ratings;
 pub mod fiat;
 pub mod driver_listings;
+pub mod stays_listings;

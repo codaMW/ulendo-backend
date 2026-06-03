@@ -1,6 +1,6 @@
 use anyhow::Result;
 use axum::{
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -209,6 +209,14 @@ async fn main() -> Result<()> {
         .route("/listings/driver/mine",           get(routes::driver_listings::list_mine))
         .route("/listings/driver/:id",            delete(routes::driver_listings::delete_one))
         .route("/listings/driver/:id/km",         post(routes::driver_listings::add_km))
+        // ── STAYS (Ulendo Accommodation) ──
+        .route("/stays/listings",                 post(routes::stays_listings::create))
+        .route("/stays/listings/mine",            get(routes::stays_listings::list_mine))
+        .route("/stays/listings/:id",             get(routes::stays_listings::get_one))
+        .route("/stays/listings/:id",             put(routes::stays_listings::update))
+        .route("/stays/listings/:id",             delete(routes::stays_listings::delete_one))
+        .route("/stays/admin/listings",           get(routes::stays_listings::list_admin))
+        .route("/stays/admin/listings/:id/verify", put(routes::stays_listings::admin_verify))
         .route("/rides/nearby-listings",          get(routes::driver_listings::nearby_listings))
         .route("/escrow/direct-release-status/:ride_id", axum::routing::get(routes::escrow::direct_release_status))
         // Rides — driver discovery
