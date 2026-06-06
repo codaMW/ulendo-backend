@@ -46,9 +46,14 @@ pub struct Config {
     pub vapid_private_key: String,
     pub frontend_origin:   String,
     pub rate_limit_rpm:    u32,
-    pub min_fare_sats:     i64,
-    pub min_price_per_km_sats: i64,
-    pub escrow_fee_bps:    u64,
+    pub min_fare_sats:          i64,
+    pub min_price_per_km_sats:  i64,
+    pub escrow_fee_bps:         u64,
+    pub at_api_key:             String,
+    pub at_username:            String,
+    pub at_sandbox:             bool,
+    pub at_phone_number:        String,
+    pub sats_per_minute_pstn:   i64,
 }
 
 impl Config {
@@ -79,6 +84,14 @@ impl Config {
                                    .unwrap_or_else(|_| "200".into()).parse().unwrap_or(200),
             min_price_per_km_sats: std::env::var("MIN_PRICE_PER_KM_SATS")
                                    .unwrap_or_else(|_| "50".into()).parse().unwrap_or(50),
+            at_api_key:            std::env::var("AT_API_KEY").unwrap_or_default(),
+            at_username:           std::env::var("AT_USERNAME")
+                                       .unwrap_or_else(|_| "sandbox".into()),
+            at_sandbox:            std::env::var("AT_SANDBOX")
+                                       .unwrap_or_else(|_| "true".into()) == "true",
+            at_phone_number:       std::env::var("AT_PHONE_NUMBER").unwrap_or_default(),
+            sats_per_minute_pstn:  std::env::var("SATS_PER_MINUTE_PSTN")
+                                       .unwrap_or_else(|_| "10".into()).parse().unwrap_or(10),
         })
     }
 }
@@ -218,6 +231,13 @@ async fn main() -> Result<()> {
         .route("/stays/admin/listings",           get(routes::stays_listings::list_admin))
         .route("/stays/admin/listings/:id/verify", put(routes::stays_listings::admin_verify))
         .route("/stays/search",                    get(routes::stays_listings::search))
+        // ── Calls: credits + PSTN bridge ──────────────────────────────────────
+        .route("/calls/balance",                    get(routes::calls::get_balance))
+        .route("/calls/topup",                      post(routes::calls::create_topup))
+        .route("/calls/topup/:id/status",           get(routes::calls::topup_status))
+        .route("/calls/pstn/outbound",              post(routes::calls::pstn_outbound))
+        .route("/calls/pstn/webhook",               post(routes::calls::pstn_webhook))
+        .route("/calls/pstn/inbound",               post(routes::calls::pstn_inbound))
         .route("/rides/nearby-listings",          get(routes::driver_listings::nearby_listings))
         .route("/escrow/direct-release-status/:ride_id", axum::routing::get(routes::escrow::direct_release_status))
         // Rides — driver discovery
