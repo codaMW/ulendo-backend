@@ -493,11 +493,42 @@ pub async fn http_send_booking(
     State(state): State<AppState>,
     Json(body): Json<HttpBookingNotify>,
 ) -> AppResult<Json<serde_json::Value>> {
+    // PHASE 2 FIX (booking path): create_ride enforces min_fare (rides.rs:89), but the
+    // /rides/notify path bypassed it -- a sub-minimum booking became a pending ride that
+    // could never be released (escrow.rs: "Booking should not have been allowed").
+    // Enforce the same floor + basic input validation so both entry points agree.
+    let fare = body.fare_sats.unwrap_or(0);
+    let min_fare = state.cfg.min_fare_sats;
+    if fare < min_fare {
+        tracing::warn!("[booking] REJECTED ride={} reason=fare_below_min fare={} min={}",
+            &body.ride_id, fare, min_fare);
+        return Err(AppError::BadRequest(format!(
+            "Minimum fare is {} sats (you offered {}). Increase your trip estimate or choose a more economical option.",
+            min_fare, fare
+        )));
+    }
+
+    let driver_exists: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT pubkey FROM driver_locations WHERE pubkey = ?1"
+    )
+    .bind(&body.driver_pubkey)
+    .fetch_optional(&state.db).await?;
+    if driver_exists.is_none() {
+        tracing::warn!("[booking] REJECTED ride={} reason=unknown_driver driver={}",
+            &body.ride_id, &body.driver_pubkey[..8.min(body.driver_pubkey.len())]);
+        return Err(AppError::BadRequest("Unknown or unregistered driver.".into()));
+    }
+
     // Store booking in ride_requests so the matched driver can poll for it
     let now = chrono::Utc::now().timestamp();
     let pickup_text = body.pickup.clone().unwrap_or_default();
     let dest_text = body.destination.clone().unwrap_or_default();
-    let fare = body.fare_sats.unwrap_or(0);
+    if pickup_text.len() > 256 || dest_text.len() > 256 {
+        return Err(AppError::BadRequest("Pickup/destination too long (max 256 characters).".into()));
+    }
+    if body.ride_id.is_empty() || body.ride_id.len() > 128 {
+        return Err(AppError::BadRequest("Invalid ride_id.".into()));
+    }
     let insert_result = sqlx::query(
         "INSERT INTO ride_requests
          (id, rider_pubkey, rider_npub, pickup_lat, pickup_lng, pickup_text, dest_text,
@@ -530,7 +561,7 @@ pub async fn http_send_booking(
             "pickup": body.pickup.unwrap_or_default(),
             "destination": body.destination.unwrap_or_default(),
             "fareSats": body.fare_sats.unwrap_or(0),
-            "passengerPubkey": body.passenger_pubkey.unwrap_or_default(),
+            "passengerPubkey": auth.public_key,
             "passengerNpub": body.passenger_npub.unwrap_or_default(),
         }
     });
